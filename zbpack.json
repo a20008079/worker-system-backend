@@ -1,0 +1,6 @@
+# zbpack.json — 告訴 Zeabur 這是 Node.js 專案
+{
+  "build_command": "npm run build",
+  "start_command": "npm start",
+  "node_version": "20"
+}
