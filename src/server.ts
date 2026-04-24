@@ -1,30 +1,21 @@
-// ============================================================
-// backend/src/server.ts  ─  師傅管理系統 Express API（完整合併版）
-// ============================================================
-// 環境變數（.env）：
-//   DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
-//   PORT=4000
-//   LATE_THRESHOLD_HOUR=8
-//   LATE_THRESHOLD_MINUTE=0
-//   OFFLINE_MINUTES=10
-//   TZ=Asia/Taipei   ← 必須設定，否則遲到判斷在 UTC 伺服器上會錯
-// ============================================================
-
-import express, { Request, Response } from 'express';
-import cors from 'cors';
+// src/server.ts — 校車定位管理系統後端
+import express, { Request, Response, NextFunction } from 'express';
 import mysql from 'mysql2/promise';
-import dotenv from 'dotenv';
+import cors from 'cors';
+import jwt from 'jsonwebtoken';
+import bcrypt from 'bcrypt';
 
-dotenv.config();
+const app  = express();
+const PORT = Number(process.env.PORT || 8080);
+const JWT_SECRET = process.env.JWT_SECRET || 'school-bus-secret-2026';
 
-const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ── DB Pool ─────────────────────────────────────────────────
+// ── DB Pool ────────────────────────────────────────────
 const pool = mysql.createPool({
   host:               process.env.DB_HOST     || 'localhost',
-  port:               Number(process.env.DB_PORT) || 3306,
+  port:               Number(process.env.DB_PORT || 3306),
   user:               process.env.DB_USER     || 'root',
   password:           process.env.DB_PASSWORD || '',
   database:           process.env.DB_NAME     || 'zeabur',
@@ -33,384 +24,313 @@ const pool = mysql.createPool({
   timezone:           '+08:00',
 });
 
-const db = async (sql: string, params?: any[]): Promise<any[]> => {
-  const [rows] = await pool.execute(sql, params);
-  return rows as any[];
-};
-
-const LATE_H  = Number(process.env.LATE_THRESHOLD_HOUR   ?? 8);
-const LATE_M  = Number(process.env.LATE_THRESHOLD_MINUTE ?? 0);
-const OFFLINE = Number(process.env.OFFLINE_MINUTES       ?? 10);
-
-// 遲到判斷 — 依賴 TZ=Asia/Taipei，setHours 使用 process 本地時間
-function isLate(now: Date): { late: boolean; minutes: number } {
-  const threshold = new Date(now);
-  threshold.setHours(LATE_H, LATE_M, 0, 0);
-  const diff = Math.floor((now.getTime() - threshold.getTime()) / 60000);
-  return { late: diff > 0, minutes: diff > 0 ? diff : 0 };
+// ── JWT Middleware ─────────────────────────────────────
+interface AuthRequest extends Request {
+  user?: { id: number; role: 'admin' | 'driver' | 'parent' };
 }
 
-function offlineCutoffStr(): string {
-  return new Date(Date.now() - OFFLINE * 60 * 1000)
-    .toISOString().slice(0, 19).replace('T', ' ');
+function auth(roles: string[]) {
+  return (req: AuthRequest, res: Response, next: NextFunction) => {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: '未登入' });
+    try {
+      const payload = jwt.verify(token, JWT_SECRET) as any;
+      if (!roles.includes(payload.role)) return res.status(403).json({ error: '權限不足' });
+      req.user = payload;
+      next();
+    } catch {
+      res.status(401).json({ error: 'Token 無效' });
+    }
+  };
 }
 
-// ── 健康檢查 ─────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════
+// AUTH
+// ══════════════════════════════════════════════════════
+
+// POST /api/auth/login
+app.post('/api/auth/login', async (req, res) => {
+  const { account, password, role } = req.body;
+  if (!account || !password || !role) return res.status(400).json({ error: '缺少欄位' });
+
+  const tableMap: Record<string, string> = {
+    admin: 'admins', driver: 'drivers', parent: 'parents',
+  };
+  const table = tableMap[role];
+  if (!table) return res.status(400).json({ error: '角色錯誤' });
+
+  try {
+    const [rows]: any = await pool.query(
+      `SELECT * FROM \`${table}\` WHERE account = ? LIMIT 1`, [account]
+    );
+    const user = rows[0];
+    if (!user) return res.status(401).json({ error: '帳號或密碼錯誤' });
+
+    // 開發階段：若密碼是 placeholder 直接比對明文
+    let ok = false;
+    if (user.password.startsWith('$2b$')) {
+      ok = await bcrypt.compare(password, user.password);
+    } else {
+      ok = password === user.password;
+    }
+    if (!ok) return res.status(401).json({ error: '帳號或密碼錯誤' });
+
+    const token = jwt.sign({ id: user.id, role, name: user.name }, JWT_SECRET, { expiresIn: '24h' });
+    res.json({ token, id: user.id, name: user.name, role });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// ══════════════════════════════════════════════════════
+// 司機端
+// ══════════════════════════════════════════════════════
+
+// GET /api/driver/me — 司機資訊 + 今日班次 + 負責校車
+app.get('/api/driver/me', auth(['driver']), async (req: AuthRequest, res) => {
+  const driverId = req.user!.id;
+  try {
+    const [drivers]: any = await pool.query(
+      `SELECT d.id, d.name, d.phone, b.id as bus_id, b.bus_name, b.route_name
+       FROM drivers d LEFT JOIN buses b ON b.driver_id = d.id
+       WHERE d.id = ? LIMIT 1`, [driverId]
+    );
+    const driver = drivers[0];
+    if (!driver) return res.status(404).json({ error: '找不到司機' });
+
+    // 今日 session
+    const [sessions]: any = await pool.query(
+      `SELECT * FROM driver_sessions WHERE driver_id = ? AND session_date = CURDATE() ORDER BY id DESC LIMIT 1`,
+      [driverId]
+    );
+    const session = sessions[0] || null;
+
+    res.json({ driver, session });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// POST /api/driver/online — 上線
+app.post('/api/driver/online', auth(['driver']), async (req: AuthRequest, res) => {
+  const driverId = req.user!.id;
+  try {
+    const [buses]: any = await pool.query(
+      `SELECT id FROM buses WHERE driver_id = ? AND is_active = 1 LIMIT 1`, [driverId]
+    );
+    const bus = buses[0];
+    if (!bus) return res.status(400).json({ error: '尚未分配校車' });
+
+    // 檢查今日是否已有 session
+    const [existing]: any = await pool.query(
+      `SELECT id FROM driver_sessions WHERE driver_id = ? AND session_date = CURDATE() AND end_time IS NULL LIMIT 1`,
+      [driverId]
+    );
+    if (existing[0]) return res.status(400).json({ error: '已經上線' });
+
+    const [result]: any = await pool.query(
+      `INSERT INTO driver_sessions (driver_id, bus_id, session_date) VALUES (?, ?, CURDATE())`,
+      [driverId, bus.id]
+    );
+    res.json({ session_id: result.insertId, bus_id: bus.id });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// POST /api/driver/offline — 下線
+app.post('/api/driver/offline', auth(['driver']), async (req: AuthRequest, res) => {
+  const driverId = req.user!.id;
+  try {
+    await pool.query(
+      `UPDATE driver_sessions SET end_time = NOW() WHERE driver_id = ? AND session_date = CURDATE() AND end_time IS NULL`,
+      [driverId]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// POST /api/location/update — GPS 回傳（司機）
+app.post('/api/location/update', auth(['driver']), async (req: AuthRequest, res) => {
+  const driverId = req.user!.id;
+  const { latitude, longitude, accuracy } = req.body;
+  try {
+    // 找今日 session
+    const [sessions]: any = await pool.query(
+      `SELECT ds.id, ds.bus_id FROM driver_sessions ds
+       WHERE ds.driver_id = ? AND ds.session_date = CURDATE() AND ds.end_time IS NULL LIMIT 1`,
+      [driverId]
+    );
+    const session = sessions[0];
+    if (!session) return res.status(400).json({ error: '尚未上線' });
+
+    await pool.query(
+      `INSERT INTO bus_locations (bus_id, session_id, latitude, longitude, accuracy) VALUES (?, ?, ?, ?, ?)`,
+      [session.bus_id, session.id, latitude, longitude, accuracy || null]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// ══════════════════════════════════════════════════════
+// 家長端
+// ══════════════════════════════════════════════════════
+
+// GET /api/parent/me — 家長資訊 + 學生 + 校車最新位置
+app.get('/api/parent/me', auth(['parent']), async (req: AuthRequest, res) => {
+  const parentId = req.user!.id;
+  try {
+    // 取得學生與對應校車
+    const [students]: any = await pool.query(
+      `SELECT s.id, s.name, s.school_class, b.id as bus_id, b.bus_name, b.route_name
+       FROM students s JOIN buses b ON s.bus_id = b.id
+       WHERE s.parent_id = ? AND s.is_active = 1`,
+      [parentId]
+    );
+
+    // 每台校車的最新位置
+    const result = await Promise.all(students.map(async (student: any) => {
+      const [locs]: any = await pool.query(
+        `SELECT latitude, longitude, created_at FROM bus_locations
+         WHERE bus_id = ? ORDER BY created_at DESC LIMIT 1`,
+        [student.bus_id]
+      );
+      // 校車是否在線
+      const [sessions]: any = await pool.query(
+        `SELECT id FROM driver_sessions WHERE bus_id = ? AND session_date = CURDATE() AND end_time IS NULL LIMIT 1`,
+        [student.bus_id]
+      );
+      return {
+        student: { id: student.id, name: student.name, school_class: student.school_class },
+        bus: { id: student.bus_id, bus_name: student.bus_name, route_name: student.route_name },
+        location: locs[0] || null,
+        is_online: sessions.length > 0,
+      };
+    }));
+
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// GET /api/bus/:busId/location — 校車最新位置（家長權限：只能看自己小孩的校車）
+app.get('/api/bus/:busId/location', auth(['parent', 'admin']), async (req: AuthRequest, res) => {
+  const busId = Number(req.params.busId);
+  const role  = req.user!.role;
+
+  try {
+    // 家長需驗證是否有權限看這台車
+    if (role === 'parent') {
+      const [check]: any = await pool.query(
+        `SELECT s.id FROM students s WHERE s.parent_id = ? AND s.bus_id = ? AND s.is_active = 1 LIMIT 1`,
+        [req.user!.id, busId]
+      );
+      if (!check[0]) return res.status(403).json({ error: '無權限查看此校車' });
+    }
+
+    const [locs]: any = await pool.query(
+      `SELECT latitude, longitude, created_at FROM bus_locations
+       WHERE bus_id = ? ORDER BY created_at DESC LIMIT 1`,
+      [busId]
+    );
+    const [sessions]: any = await pool.query(
+      `SELECT id FROM driver_sessions WHERE bus_id = ? AND session_date = CURDATE() AND end_time IS NULL LIMIT 1`,
+      [busId]
+    );
+
+    res.json({
+      location: locs[0] || null,
+      is_online: sessions.length > 0,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// ══════════════════════════════════════════════════════
+// 管理員端
+// ══════════════════════════════════════════════════════
+
+// GET /api/admin/buses — 所有校車 + 狀態
+app.get('/api/admin/buses', auth(['admin']), async (_req, res) => {
+  try {
+    const [buses]: any = await pool.query(
+      `SELECT b.id, b.bus_name, b.route_name, b.is_active,
+              d.id as driver_id, d.name as driver_name,
+              bl.latitude, bl.longitude, bl.created_at as last_seen,
+              (SELECT COUNT(*) FROM students s WHERE s.bus_id = b.id AND s.is_active = 1) as student_count,
+              (SELECT id FROM driver_sessions ds WHERE ds.bus_id = b.id AND ds.session_date = CURDATE() AND ds.end_time IS NULL LIMIT 1) as session_id
+       FROM buses b
+       LEFT JOIN drivers d ON b.driver_id = d.id
+       LEFT JOIN bus_locations bl ON bl.id = (
+         SELECT id FROM bus_locations WHERE bus_id = b.id ORDER BY created_at DESC LIMIT 1
+       )
+       ORDER BY b.route_name, b.bus_name`
+    );
+    res.json(buses);
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// GET /api/admin/students — 所有學生
+app.get('/api/admin/students', auth(['admin']), async (_req, res) => {
+  try {
+    const [rows]: any = await pool.query(
+      `SELECT s.id, s.name, s.school_class, s.is_active,
+              p.name as parent_name, p.account as parent_account,
+              b.bus_name, b.route_name
+       FROM students s
+       JOIN parents p ON s.parent_id = p.id
+       JOIN buses b ON s.bus_id = b.id
+       ORDER BY b.route_name, s.name`
+    );
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// POST /api/admin/students — 新增學生
+app.post('/api/admin/students', auth(['admin']), async (req, res) => {
+  const { name, school_class, parent_id, bus_id } = req.body;
+  try {
+    const [r]: any = await pool.query(
+      `INSERT INTO students (name, school_class, parent_id, bus_id) VALUES (?, ?, ?, ?)`,
+      [name, school_class, parent_id, bus_id]
+    );
+    res.json({ id: r.insertId });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// GET /api/admin/drivers — 所有司機
+app.get('/api/admin/drivers', auth(['admin']), async (_req, res) => {
+  try {
+    const [rows]: any = await pool.query(
+      `SELECT d.id, d.name, d.phone, d.account, d.is_active,
+              b.bus_name, b.route_name
+       FROM drivers d LEFT JOIN buses b ON b.driver_id = d.id
+       ORDER BY d.name`
+    );
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// ══════════════════════════════════════════════════════
+// Health Check
+// ══════════════════════════════════════════════════════
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// ============================================================
-// 1. 師傅 API
-// ============================================================
-
-app.get('/api/workers', async (_req: Request, res: Response) => {
-  try {
-    const cutoff = offlineCutoffStr();
-    const workers = await db(`
-      SELECT
-        w.id, w.name, w.phone, w.is_active,
-        ll.latitude, ll.longitude, ll.created_at AS last_location_at,
-        al.id        AS attendance_id,
-        al.start_time, al.end_time, al.is_late, al.late_minutes,
-        CASE
-          WHEN al.id IS NOT NULL AND al.end_time IS NULL AND ll.created_at >= ?
-          THEN 1 ELSE 0
-        END AS is_online
-      FROM workers w
-      LEFT JOIN (
-        SELECT l1.worker_id, l1.latitude, l1.longitude, l1.created_at
-        FROM location_logs l1
-        INNER JOIN (
-          SELECT worker_id, MAX(created_at) AS max_at FROM location_logs GROUP BY worker_id
-        ) l2 ON l1.worker_id = l2.worker_id AND l1.created_at = l2.max_at
-      ) ll ON ll.worker_id = w.id
-      LEFT JOIN attendance_logs al ON al.worker_id = w.id AND al.work_date = CURDATE()
-      WHERE w.is_active = 1
-      ORDER BY is_online DESC, w.name
-    `, [cutoff]);
-    res.json({ success: true, data: workers });
-  } catch (e: any) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-app.get('/api/workers/:id', async (req: Request, res: Response) => {
-  try {
-    const [worker] = await db('SELECT * FROM workers WHERE id = ?', [req.params.id]);
-    if (!worker) return res.status(404).json({ success: false, error: '找不到師傅' });
-    res.json({ success: true, data: worker });
-  } catch (e: any) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-app.post('/api/workers', async (req: Request, res: Response) => {
-  const { name, phone, role = 'worker', line_user_id } = req.body;
-  if (!name || !phone) return res.status(400).json({ success: false, error: '缺少 name / phone' });
-  try {
-    const [result]: any = await pool.execute(
-      'INSERT INTO workers (name, phone, role, line_user_id) VALUES (?,?,?,?)',
-      [name, phone, role, line_user_id || null]
-    );
-    res.json({ success: true, data: { id: result.insertId } });
-  } catch (e: any) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-app.patch('/api/workers/:id', async (req: Request, res: Response) => {
-  const { name, phone, is_active } = req.body;
-  try {
-    await pool.execute(
-      'UPDATE workers SET name=COALESCE(?,name), phone=COALESCE(?,phone), is_active=COALESCE(?,is_active) WHERE id=?',
-      [name ?? null, phone ?? null, is_active ?? null, req.params.id]
-    );
-    res.json({ success: true });
-  } catch (e: any) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// ============================================================
-// 2. 出勤打卡 API
-// ============================================================
-
-app.post('/api/attendance/start', async (req: Request, res: Response) => {
-  const { worker_id, latitude, longitude } = req.body;
-  if (!worker_id) return res.status(400).json({ success: false, error: '缺少 worker_id' });
-  try {
-    const existing = await db(
-      'SELECT id FROM attendance_logs WHERE worker_id = ? AND work_date = CURDATE() AND end_time IS NULL',
-      [worker_id]
-    );
-    if (existing.length > 0)
-      return res.status(409).json({ success: false, error: '今日已有未結束的出勤紀錄' });
-
-    const now = new Date();
-    const { late, minutes } = isLate(now);
-    const workDate = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
-
-    const [result]: any = await pool.execute(
-      'INSERT INTO attendance_logs (worker_id, start_time, is_late, late_minutes, work_date) VALUES (?,?,?,?,?)',
-      [worker_id, now, late ? 1 : 0, minutes, workDate]
-    );
-    const attendance_id = result.insertId;
-
-    if (latitude != null && longitude != null) {
-      await pool.execute(
-        'INSERT INTO location_logs (worker_id, attendance_id, latitude, longitude) VALUES (?,?,?,?)',
-        [worker_id, attendance_id, latitude, longitude]
-      );
-    }
-    res.json({ success: true, data: { attendance_id, start_time: now, is_late: late, late_minutes: minutes } });
-  } catch (e: any) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-app.post('/api/attendance/end', async (req: Request, res: Response) => {
-  const { worker_id } = req.body;
-  if (!worker_id) return res.status(400).json({ success: false, error: '缺少 worker_id' });
-  try {
-    const [active] = await db(
-      'SELECT id, start_time FROM attendance_logs WHERE worker_id = ? AND work_date = CURDATE() AND end_time IS NULL',
-      [worker_id]
-    );
-    if (!active) return res.status(404).json({ success: false, error: '找不到今日出勤紀錄' });
-
-    const now = new Date();
-    await pool.execute('UPDATE attendance_logs SET end_time = ? WHERE id = ?', [now, active.id]);
-    const workMinutes = Math.floor((now.getTime() - new Date(active.start_time).getTime()) / 60000);
-    res.json({ success: true, data: { end_time: now, work_minutes: workMinutes } });
-  } catch (e: any) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-app.get('/api/attendance/today/:worker_id', async (req: Request, res: Response) => {
-  try {
-    const [log] = await db(
-      'SELECT * FROM attendance_logs WHERE worker_id = ? AND work_date = CURDATE() ORDER BY id DESC LIMIT 1',
-      [req.params.worker_id]
-    );
-    res.json({ success: true, data: log || null });
-  } catch (e: any) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-app.get('/api/attendance/monthly/:worker_id', async (req: Request, res: Response) => {
-  try {
-    const rows = await db(`
-      SELECT id, work_date, start_time, end_time, is_late, late_minutes
-      FROM attendance_logs
-      WHERE worker_id = ?
-        AND YEAR(work_date)  = YEAR(CURDATE())
-        AND MONTH(work_date) = MONTH(CURDATE())
-      ORDER BY work_date DESC
-    `, [req.params.worker_id]);
-    res.json({ success: true, data: rows });
-  } catch (e: any) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// ============================================================
-// 3. 定位 API
-// ============================================================
-
-// 下班後 /api/location/update 會回傳 403，前端 hook 的 setInterval 仍在跑
-// 但資料不會寫入 DB — 這是預期行為，前端靠 is_online flag 停止顯示
-app.post('/api/location/update', async (req: Request, res: Response) => {
-  const { worker_id, latitude, longitude, accuracy } = req.body;
-  if (!worker_id || latitude == null || longitude == null)
-    return res.status(400).json({ success: false, error: '缺少必要參數' });
-  try {
-    const [attendance] = await db(
-      'SELECT id FROM attendance_logs WHERE worker_id = ? AND work_date = CURDATE() AND end_time IS NULL',
-      [worker_id]
-    );
-    if (!attendance)
-      return res.status(403).json({ success: false, error: '未上班，不接受定位' });
-
-    await pool.execute(
-      'INSERT INTO location_logs (worker_id, attendance_id, latitude, longitude, accuracy) VALUES (?,?,?,?,?)',
-      [worker_id, attendance.id, latitude, longitude, accuracy ?? null]
-    );
-    res.json({ success: true });
-  } catch (e: any) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-app.get('/api/location/latest', async (_req: Request, res: Response) => {
-  try {
-    const cutoff = offlineCutoffStr();
-    const rows = await db(`
-      SELECT
-        w.id AS worker_id, w.name,
-        ll.latitude, ll.longitude, ll.created_at AS last_seen,
-        CASE
-          WHEN al.id IS NOT NULL AND al.end_time IS NULL AND ll.created_at >= ?
-          THEN 1 ELSE 0
-        END AS is_online,
-        al.start_time
-      FROM workers w
-      INNER JOIN (
-        SELECT l1.worker_id, l1.latitude, l1.longitude, l1.created_at
-        FROM location_logs l1
-        INNER JOIN (
-          SELECT worker_id, MAX(created_at) AS max_at FROM location_logs GROUP BY worker_id
-        ) l2 ON l1.worker_id = l2.worker_id AND l1.created_at = l2.max_at
-      ) ll ON ll.worker_id = w.id
-      LEFT JOIN attendance_logs al ON al.worker_id = w.id AND al.work_date = CURDATE()
-      WHERE w.is_active = 1
-    `, [cutoff]);
-    res.json({ success: true, data: rows });
-  } catch (e: any) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-app.get('/api/location/trail/:worker_id', async (req: Request, res: Response) => {
-  try {
-    const date = (req.query.date as string) || new Date().toISOString().slice(0, 10);
-    const rows = await db(
-      'SELECT latitude, longitude, created_at FROM location_logs WHERE worker_id = ? AND DATE(created_at) = ? ORDER BY created_at ASC',
-      [req.params.worker_id, date]
-    );
-    res.json({ success: true, data: rows });
-  } catch (e: any) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// ============================================================
-// 4. 工程紀錄 API
-// ============================================================
-
-app.post('/api/job/record', async (req: Request, res: Response) => {
-  const { worker_id, type, latitude, longitude, note } = req.body;
-  if (!worker_id || !type || latitude == null || longitude == null)
-    return res.status(400).json({ success: false, error: '缺少必要參數' });
-  if (!['arrived', 'left'].includes(type))
-    return res.status(400).json({ success: false, error: 'type 只允許 arrived / left' });
-  try {
-    const [attendance] = await db(
-      'SELECT id FROM attendance_logs WHERE worker_id = ? AND work_date = CURDATE() AND end_time IS NULL',
-      [worker_id]
-    );
-    if (!attendance)
-      return res.status(403).json({ success: false, error: '尚未開始上班，無法記錄' });
-
-    const [result]: any = await pool.execute(
-      'INSERT INTO job_records (worker_id, attendance_id, type, latitude, longitude, note) VALUES (?,?,?,?,?,?)',
-      [worker_id, attendance.id, type, latitude, longitude, note ?? null]
-    );
-    res.json({ success: true, data: { id: result.insertId, type } });
-  } catch (e: any) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-app.get('/api/job/records/:worker_id', async (req: Request, res: Response) => {
-  try {
-    const date = (req.query.date as string) || new Date().toISOString().slice(0, 10);
-    const rows = await db(`
-      SELECT jr.id, jr.type, jr.latitude, jr.longitude, jr.note, jr.created_at
-      FROM job_records jr
-      LEFT JOIN attendance_logs al ON al.id = jr.attendance_id
-      WHERE jr.worker_id = ?
-        AND DATE(COALESCE(al.work_date, jr.created_at)) = ?
-      ORDER BY jr.created_at DESC
-    `, [req.params.worker_id, date]);
-    res.json({ success: true, data: rows });
-  } catch (e: any) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// ============================================================
-// 5. 統計 API
-// ============================================================
-
-app.get('/api/stats/dashboard', async (_req: Request, res: Response) => {
-  try {
-    const [[todayJobs]]: any = await pool.execute(
-      'SELECT COUNT(*) AS cnt FROM job_records WHERE DATE(created_at) = CURDATE()'
-    );
-    const [[monthLogs]]: any = await pool.execute(
-      'SELECT COUNT(*) AS cnt FROM attendance_logs WHERE YEAR(work_date)=YEAR(CURDATE()) AND MONTH(work_date)=MONTH(CURDATE())'
-    );
-    const [[customers]]: any = await pool.execute(
-      'SELECT COUNT(*) AS cnt FROM customers WHERE is_active=1'
-    );
-    const [[onlineNow]]: any = await pool.execute(`
-      SELECT COUNT(DISTINCT w.id) AS cnt
-      FROM workers w
-      JOIN attendance_logs al ON al.worker_id=w.id AND al.work_date=CURDATE() AND al.end_time IS NULL
-      JOIN location_logs ll ON ll.worker_id=w.id
-        AND ll.created_at >= DATE_SUB(NOW(), INTERVAL ? MINUTE)
-    `, [OFFLINE]);
-    res.json({
-      success: true,
-      data: {
-        today_jobs:      todayJobs.cnt,
-        month_records:   monthLogs.cnt,
-        total_customers: customers.cnt,
-        online_workers:  onlineNow.cnt,
-      }
-    });
-  } catch (e: any) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-app.get('/api/stats/worker/:id', async (req: Request, res: Response) => {
-  try {
-    const [stats] = await db(`
-      SELECT
-        COUNT(*) AS attend_days,
-        SUM(is_late) AS late_count,
-        SUM(TIMESTAMPDIFF(MINUTE, start_time, IFNULL(end_time, NOW()))) AS total_minutes
-      FROM attendance_logs
-      WHERE worker_id = ?
-        AND YEAR(work_date) = YEAR(CURDATE())
-        AND MONTH(work_date) = MONTH(CURDATE())
-    `, [req.params.id]);
-    res.json({
-      success: true,
-      data: {
-        attend_days:   Number(stats.attend_days)   || 0,
-        late_count:    Number(stats.late_count)    || 0,
-        total_hours:   Math.floor((Number(stats.total_minutes) || 0) / 60),
-        total_minutes: (Number(stats.total_minutes) || 0) % 60,
-      }
-    });
-  } catch (e: any) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// ============================================================
-// 6. 客戶 API
-// ============================================================
-
-app.get('/api/customers', async (_req: Request, res: Response) => {
-  try {
-    const rows = await db('SELECT * FROM customers WHERE is_active = 1 ORDER BY name');
-    res.json({ success: true, data: rows });
-  } catch (e: any) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// ── 啟動 ─────────────────────────────────────────────────────
-const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
-  console.log(`✅ API Server running on port ${PORT}`);
-  console.log(`   TZ=${process.env.TZ || '(未設定！遲到判斷將用伺服器本地時間)'}`);
-  console.log(`   遲到門檻：${LATE_H}:${String(LATE_M).padStart(2,'0')}`);
-  console.log(`   離線門檻：${OFFLINE} 分鐘`);
+  console.log(`✅ 校車系統 API running on port ${PORT}`);
+  console.log(`   TZ=${process.env.TZ || '(未設定)'}`);
 });
-
-export default app;
