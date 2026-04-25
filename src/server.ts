@@ -927,6 +927,43 @@ app.post('/api/admin/import-full', auth(['admin']), async (req: AuthRequest, res
     conn.release();
   }
 });
+// GET /api/admin/export — 匯出現有學生資料為 CSV
+app.get('/api/admin/export', auth(['admin']), async (_req, res) => {
+  try {
+    const [rows]: any = await pool.query(
+      `SELECT
+        b.route_name, b.bus_name,
+        d.name as driver_name, d.phone as driver_phone,
+        s.name as student_name, s.student_code, s.school_class as class_name,
+        p.name as parent_name, p.phone as parent_phone
+       FROM students s
+       LEFT JOIN buses b ON s.bus_id = b.id
+       LEFT JOIN drivers d ON b.driver_id = d.id
+       LEFT JOIN parents p ON s.parent_id = p.id
+       WHERE s.is_active = 1
+       ORDER BY b.route_name, b.bus_name, s.name`
+    );
+
+    const headers = ['route_name','bus_name','driver_name','driver_phone','student_name','student_code','class_name','parent_name','parent_phone'];
+    const headerRow = headers.join(',');
+    const dataRows = rows.map((r: any) =>
+      headers.map(h => {
+        const val = r[h] || '';
+        // 如果有逗號或換行，用引號包起來
+        return String(val).includes(',') ? `"${val}"` : val;
+      }).join(',')
+    );
+
+    const csv = '\uFEFF' + [headerRow, ...dataRows].join('\n');
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="school-bus-students.csv"');
+    res.send(csv);
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`✅ 校車系統 API running on port ${PORT}`);
   console.log(`   TZ=${process.env.TZ || '(未設定)'}`);
