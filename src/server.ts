@@ -927,7 +927,7 @@ app.post('/api/admin/import-full', auth(['admin']), async (req: AuthRequest, res
     conn.release();
   }
 });
-// GET /api/admin/export — 匯出現有學生資料為 CSV
+// GET /api/admin/export — 匯出現有學生資料為漂亮的 xlsx
 app.get('/api/admin/export', auth(['admin']), async (_req, res) => {
   try {
     const [rows]: any = await pool.query(
@@ -944,25 +944,97 @@ app.get('/api/admin/export', auth(['admin']), async (_req, res) => {
        ORDER BY b.route_name, b.bus_name, s.name`
     );
 
+    const XLSX = require('xlsx');
+
+    const wb = XLSX.utils.book_new();
+
+    // ── 學生名單 Sheet ──
     const headers = ['route_name','bus_name','driver_name','driver_phone','student_name','student_code','class_name','parent_name','parent_phone'];
-    const headerRow = headers.join(',');
-    const dataRows = rows.map((r: any) =>
-      headers.map(h => {
-        const val = r[h] || '';
-        // 如果有逗號或換行，用引號包起來
-        return String(val).includes(',') ? `"${val}"` : val;
-      }).join(',')
-    );
+    const headerLabels = ['路線名稱','車次名稱','司機姓名','司機手機','學生姓名','學生證號','班級','家長姓名','家長手機'];
+    const notes = ['選填','必填','選填','選填（司機帳號）','必填','選填（掃描用）','選填','必填','必填（家長帳號）'];
 
-    const csv = '\uFEFF' + [headerRow, ...dataRows].join('\n');
+    const wsData: any[][] = [
+      // 第一列：欄位英文名
+      headers,
+      // 第二列：欄位中文說明
+      headerLabels,
+      // 第三列：備註
+      notes,
+      // 空白分隔
+    ];
 
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', 'attachment; filename="school-bus-students.csv"');
-    res.send(csv);
+    // 加入資料
+    if (rows.length > 0) {
+      rows.forEach((r: any) => {
+        wsData.push(headers.map(h => r[h] || ''));
+      });
+    } else {
+      // 沒有資料時放範例
+      wsData.push(['觀音線','觀音線01','陳大明','0912345678','王小明','S001','三年二班','王爸爸','0911111111']);
+      wsData.push(['觀音線','觀音線01','陳大明','0912345678','李小美','S002','四年一班','李媽媽','0922222222']);
+    }
+
+    const ws = XLSX.utils.aoa_to_sheet(wsData);
+
+    // 欄寬設定
+    ws['!cols'] = [
+      { wch: 12 }, { wch: 14 }, { wch: 12 }, { wch: 18 },
+      { wch: 12 }, { wch: 14 }, { wch: 12 }, { wch: 12 }, { wch: 18 }
+    ];
+
+    // 凍結前三列（欄位說明）
+    ws['!freeze'] = { xSplit: 0, ySplit: 3 };
+
+    XLSX.utils.book_append_sheet(wb, ws, '學生名單');
+
+    // ── 填寫說明 Sheet ──
+    const ws2Data = [
+      ['填寫說明', ''],
+      ['', ''],
+      ['【必填欄位】', ''],
+      ['bus_name', '車次名稱，例如：觀音線01、大園線01'],
+      ['student_name', '學生姓名'],
+      ['parent_name', '家長姓名'],
+      ['parent_phone', '家長手機號碼（作為家長登入帳號，密碼預設為手機後4碼）'],
+      ['', ''],
+      ['【選填欄位】', ''],
+      ['route_name', '路線名稱，例如：觀音線、大園線'],
+      ['driver_name', '司機姓名'],
+      ['driver_phone', '司機手機號碼（作為司機登入帳號，密碼預設為手機後4碼）'],
+      ['student_code', '學生證號（用於司機掃描學生上車，建議填寫）'],
+      ['class_name', '學生班級，例如：三年二班'],
+      ['', ''],
+      ['【匯入邏輯】', ''],
+      ['校車', 'bus_name 不存在 → 自動建立校車'],
+      ['司機', 'driver_phone 不存在 → 自動建立司機帳號'],
+      ['家長', 'parent_phone 不存在 → 自動建立家長帳號'],
+      ['學生', 'student_code 不存在 → 建立新學生'],
+      ['更新', 'student_code 已存在 → 更新學生資料'],
+      ['', ''],
+      ['【注意事項】', ''],
+      ['1.', '同一台校車的學生，bus_name 要完全一致'],
+      ['2.', '家長手機號碼作為帳號，不可重複'],
+      ['3.', '第4行起填寫實際資料，可刪除範例資料'],
+      ['4.', `匯出時間：${new Date().toLocaleString('zh-TW')}`],
+      ['5.', `共 ${rows.length} 筆學生資料`],
+    ];
+
+    const ws2 = XLSX.utils.aoa_to_sheet(ws2Data);
+    ws2['!cols'] = [{ wch: 18 }, { wch: 55 }];
+    XLSX.utils.book_append_sheet(wb, ws2, '填寫說明');
+
+    // 輸出 buffer
+    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+
+    const today = new Date().toLocaleDateString('zh-TW').replace(/\//g, '');
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''%E6%A0%A1%E8%BB%8A%E5%AD%B8%E7%94%9F%E8%B3%87%E6%96%99%E5%BA%AB_${today}.xlsx`);
+    res.send(buf);
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
 });
+
 
 app.listen(PORT, () => {
   console.log(`✅ 校車系統 API running on port ${PORT}`);
