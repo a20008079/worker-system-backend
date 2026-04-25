@@ -204,11 +204,24 @@ app.get('/api/parent/me', auth(['parent']), async (req: AuthRequest, res) => {
         `SELECT id FROM driver_sessions WHERE bus_id = ? AND session_date = CURDATE() AND end_time IS NULL LIMIT 1`,
         [student.bus_id]
       );
+      const sessionId = sessions[0]?.id || null;
+
+      // 學生今日是否已上車
+      let boarded_at = null;
+      if (sessionId) {
+        const [boarding]: any = await pool.query(
+          `SELECT boarded_at FROM boarding_records WHERE student_id = ? AND session_id = ? LIMIT 1`,
+          [student.id, sessionId]
+        );
+        boarded_at = boarding[0]?.boarded_at || null;
+      }
+
       return {
         student: { id: student.id, name: student.name, school_class: student.school_class },
         bus: { id: student.bus_id, bus_name: student.bus_name, route_name: student.route_name },
         location: locs[0] || null,
         is_online: sessions.length > 0,
+        boarded_at,
       };
     }));
 
