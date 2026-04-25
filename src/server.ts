@@ -330,7 +330,6 @@ app.get('/api/admin/drivers', auth(['admin']), async (_req, res) => {
 // ══════════════════════════════════════════════════════
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// =====================================================
 // 新增以下 API 到 server.ts
 // 放在 "管理員端" 區塊之後，app.listen 之前
 // =====================================================
@@ -595,8 +594,138 @@ app.get('/api/admin/buses-simple', auth(['admin']), async (_req, res) => {
     res.status(500).json({ error: String(e) });
   }
 });
+// =====================================================
+// 帳號管理 API
+// 加到 server.ts 的 app.listen 之前
+// =====================================================
 
+// ══════════════════════════════════════════════════════
+// GET /api/admin/accounts — 取得所有帳號
+// ══════════════════════════════════════════════════════
+app.get('/api/admin/accounts', auth(['admin']), async (_req, res) => {
+  try {
+    const [drivers]: any = await pool.query(
+      `SELECT id, name, account, phone, is_active, 'driver' as role FROM drivers ORDER BY name`
+    );
+    const [parents]: any = await pool.query(
+      `SELECT id, name, account, phone, 1 as is_active, 'parent' as role FROM parents ORDER BY name`
+    );
+    const [admins]: any = await pool.query(
+      `SELECT id, name, account, '' as phone, 1 as is_active, 'admin' as role FROM admins ORDER BY name`
+    );
+    res.json({ drivers, parents, admins });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
 
+// ══════════════════════════════════════════════════════
+// POST /api/admin/accounts — 新增帳號
+// ══════════════════════════════════════════════════════
+app.post('/api/admin/accounts', auth(['admin']), async (req, res) => {
+  const { role, name, account, password, phone } = req.body;
+  if (!role || !name || !account || !password) {
+    return res.status(400).json({ error: '缺少必要欄位' });
+  }
+  try {
+    if (role === 'driver') {
+      await pool.query(
+        `INSERT INTO drivers (name, account, password, phone) VALUES (?, ?, ?, ?)`,
+        [name, account, password, phone || '']
+      );
+    } else if (role === 'parent') {
+      await pool.query(
+        `INSERT INTO parents (name, account, password, phone) VALUES (?, ?, ?, ?)`,
+        [name, account, password, phone || '']
+      );
+    } else if (role === 'admin') {
+      await pool.query(
+        `INSERT INTO admins (name, account, password) VALUES (?, ?, ?)`,
+        [name, account, password]
+      );
+    } else {
+      return res.status(400).json({ error: '角色錯誤' });
+    }
+    res.json({ ok: true });
+  } catch (e: any) {
+    if (e.code === 'ER_DUP_ENTRY') {
+      return res.status(400).json({ error: '帳號已存在' });
+    }
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// ══════════════════════════════════════════════════════
+// PUT /api/admin/accounts/:role/:id — 修改帳號
+// ══════════════════════════════════════════════════════
+app.put('/api/admin/accounts/:role/:id', auth(['admin']), async (req, res) => {
+  const { role, id } = req.params;
+  const { name, account, password, phone } = req.body;
+  try {
+    if (role === 'driver') {
+      if (password) {
+        await pool.query(
+          `UPDATE drivers SET name=?, account=?, password=?, phone=? WHERE id=?`,
+          [name, account, password, phone || '', id]
+        );
+      } else {
+        await pool.query(
+          `UPDATE drivers SET name=?, account=?, phone=? WHERE id=?`,
+          [name, account, phone || '', id]
+        );
+      }
+    } else if (role === 'parent') {
+      if (password) {
+        await pool.query(
+          `UPDATE parents SET name=?, account=?, password=?, phone=? WHERE id=?`,
+          [name, account, password, phone || '', id]
+        );
+      } else {
+        await pool.query(
+          `UPDATE parents SET name=?, account=?, phone=? WHERE id=?`,
+          [name, account, phone || '', id]
+        );
+      }
+    } else if (role === 'admin') {
+      if (password) {
+        await pool.query(
+          `UPDATE admins SET name=?, account=?, password=? WHERE id=?`,
+          [name, account, password, id]
+        );
+      } else {
+        await pool.query(
+          `UPDATE admins SET name=?, account=? WHERE id=?`,
+          [name, account, id]
+        );
+      }
+    }
+    res.json({ ok: true });
+  } catch (e: any) {
+    if (e.code === 'ER_DUP_ENTRY') {
+      return res.status(400).json({ error: '帳號已存在' });
+    }
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// ══════════════════════════════════════════════════════
+// DELETE /api/admin/accounts/:role/:id — 刪除帳號
+// ══════════════════════════════════════════════════════
+app.delete('/api/admin/accounts/:role/:id', auth(['admin']), async (req, res) => {
+  const { role, id } = req.params;
+  try {
+    if (role === 'driver') {
+      await pool.query(`DELETE FROM drivers WHERE id=?`, [id]);
+    } else if (role === 'parent') {
+      await pool.query(`DELETE FROM parents WHERE id=?`, [id]);
+    } else if (role === 'admin') {
+      await pool.query(`DELETE FROM admins WHERE id=?`, [id]);
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
 app.listen(PORT, () => {
   console.log(`✅ 校車系統 API running on port ${PORT}`);
   console.log(`   TZ=${process.env.TZ || '(未設定)'}`);
