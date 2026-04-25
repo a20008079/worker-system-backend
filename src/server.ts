@@ -739,7 +739,196 @@ app.delete('/api/admin/accounts/:role/:id', auth(['admin']), async (req, res) =>
     res.status(500).json({ error: String(e) });
   }
 });
+// 新增以下 API 到 server.ts 的 app.listen 之前
+// =====================================================
+
+// ══════════════════════════════════════════════════════
+// GET /api/driver/students — 司機今日應載學生 + 上車狀態
+// ══════════════════════════════════════════════════════
+app.get('/api/driver/students', auth(['driver']), async (req: AuthRequest, res) => {
+  const driverId = req.user!.id;
+  try {
+    // 找司機負責的校車
+    const [buses]: any = await pool.query(
+      `SELECT id FROM buses WHERE driver_id = ? AND is_active = 1 LIMIT 1`, [driverId]
+    );
+    const bus = buses[0];
+    if (!bus) return res.json({ students: [], session: null });
+
+    // 今日 session
+    const [sessions]: any = await pool.query(
+      `SELECT id FROM driver_sessions WHERE driver_id = ? AND session_date = CURDATE() AND end_time IS NULL LIMIT 1`,
+      [driverId]
+    );
+    const session = sessions[0] || null;
+
+    // 取得所有應載學生
+    const [students]: any = await pool.query(
+      `SELECT s.id, s.name, s.school_class, s.student_code,
+              p.name as parent_name, p.phone as parent_phone
+       FROM students s
+       LEFT JOIN parents p ON s.parent_id = p.id
+       WHERE s.bus_id = ? AND s.is_active = 1
+       ORDER BY s.school_class, s.name`,
+      [bus.id]
+    );
+
+    // 如果有今日 session，查上車紀錄
+    let boardedIds: number[] = [];
+    let boardingTimes: Record<number, string> = {};
+    if (session) {
+      const [boarding]: any = await pool.query(
+        `SELECT student_id, boarded_at FROM boarding_records WHERE session_id = ?`,
+        [session.id]
+      );
+      boardedIds = boarding.map((b: any) => b.student_id);
+      boarding.forEach((b: any) => { boardingTimes[b.student_id] = b.boarded_at; });
+    }
+
+    const result = students.map((s: any) => ({
+      ...s,
+      is_boarded: boardedIds.includes(s.id),
+      boarded_at: boardingTimes[s.id] || null,
+    }));
+
+    res.json({
+      students: result,
+      session,
+      total: result.length,
+      boarded: boardedIds.length,
+      missing: result.length - boardedIds.length,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// ══════════════════════════════════════════════════════
+// POST /api/admin/import-full — 完整匯入（司機+校車+學生+家長）
+// ══════════════════════════════════════════════════════
+app.post('/api/admin/import-full', auth(['admin']), async (req: AuthRequest, res) => {
+  const { rows } = req.body;
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return res.status(400).json({ error: '沒有資料' });
+  }
+
+  let added = 0, updated = 0, failed = 0;
+  const errors: string[] = [];
+  const conn = await pool.getConnection();
+
+  try {
+    await conn.beginTransaction();
+
+    for (const row of rows) {
+      try {
+        const {
+          route_name, bus_name, driver_name, driver_phone,
+          student_name, student_code, class_name,
+          parent_name, parent_phone,
+        } = row;
+
+        if (!bus_name || !student_name || !parent_phone) {
+          failed++;
+          errors.push(`${student_name || '?'}: 缺少必要欄位（bus_name / student_name / parent_phone）`);
+          continue;
+        }
+
+        // 1. 找或建立校車
+        let busId: number;
+        const [existingBus]: any = await conn.query(
+          `SELECT id FROM buses WHERE bus_name = ? LIMIT 1`, [bus_name]
+        );
+        if (existingBus[0]) {
+          busId = existingBus[0].id;
+        } else {
+          // 找或建立司機
+          let driverId: number | null = null;
+          if (driver_phone) {
+            const [existingDriver]: any = await conn.query(
+              `SELECT id FROM drivers WHERE account = ? LIMIT 1`, [driver_phone]
+            );
+            if (existingDriver[0]) {
+              driverId = existingDriver[0].id;
+            } else if (driver_name) {
+              const password = driver_phone.slice(-4);
+              const [dr]: any = await conn.query(
+                `INSERT INTO drivers (name, phone, account, password) VALUES (?, ?, ?, ?)`,
+                [driver_name, driver_phone, driver_phone, password]
+              );
+              driverId = dr.insertId;
+            }
+          }
+          const [br]: any = await conn.query(
+            `INSERT INTO buses (bus_name, route_name, driver_id) VALUES (?, ?, ?)`,
+            [bus_name, route_name || bus_name, driverId]
+          );
+          busId = br.insertId;
+        }
+
+        // 2. 找或建立家長
+        let parentId: number;
+        const [existingParent]: any = await conn.query(
+          `SELECT id FROM parents WHERE phone = ? OR account = ? LIMIT 1`,
+          [parent_phone, parent_phone]
+        );
+        if (existingParent[0]) {
+          parentId = existingParent[0].id;
+          await conn.query(
+            `UPDATE parents SET name = ? WHERE id = ?`, [parent_name, parentId]
+          );
+        } else {
+          const password = parent_phone.slice(-4);
+          const [pr]: any = await conn.query(
+            `INSERT INTO parents (name, account, password, phone) VALUES (?, ?, ?, ?)`,
+            [parent_name, parent_phone, password, parent_phone]
+          );
+          parentId = pr.insertId;
+        }
+
+        // 3. 找或建立學生
+        if (student_code) {
+          const [existingStudent]: any = await conn.query(
+            `SELECT id FROM students WHERE student_code = ? LIMIT 1`, [student_code]
+          );
+          if (existingStudent[0]) {
+            await conn.query(
+              `UPDATE students SET name=?, school_class=?, parent_id=?, bus_id=?, parent_phone=? WHERE id=?`,
+              [student_name, class_name, parentId, busId, parent_phone, existingStudent[0].id]
+            );
+            updated++;
+          } else {
+            await conn.query(
+              `INSERT INTO students (name, school_class, parent_id, bus_id, student_code, parent_phone)
+               VALUES (?, ?, ?, ?, ?, ?)`,
+              [student_name, class_name, parentId, busId, student_code, parent_phone]
+            );
+            added++;
+          }
+        } else {
+          await conn.query(
+            `INSERT INTO students (name, school_class, parent_id, bus_id, parent_phone)
+             VALUES (?, ?, ?, ?, ?)`,
+            [student_name, class_name, parentId, busId, parent_phone]
+          );
+          added++;
+        }
+      } catch (e: any) {
+        failed++;
+        errors.push(`${row.student_name || '?'}: ${e.message}`);
+      }
+    }
+
+    await conn.commit();
+    res.json({ ok: true, added, updated, failed, errors });
+  } catch (e) {
+    await conn.rollback();
+    res.status(500).json({ error: String(e) });
+  } finally {
+    conn.release();
+  }
+});
 app.listen(PORT, () => {
   console.log(`✅ 校車系統 API running on port ${PORT}`);
   console.log(`   TZ=${process.env.TZ || '(未設定)'}`);
 });
+// =====================================================
