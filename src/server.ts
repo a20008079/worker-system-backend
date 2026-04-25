@@ -944,93 +944,164 @@ app.get('/api/admin/export', auth(['admin']), async (_req, res) => {
        ORDER BY b.route_name, b.bus_name, s.name`
     );
 
-    const XLSX = require('xlsx');
+    const ExcelJS = require('exceljs');
+    const wb = new ExcelJS.Workbook();
+    wb.creator = '校車定位系統';
+    wb.created = new Date();
 
-    const wb = XLSX.utils.book_new();
+    // ══════════════════════════════════════════
+    // Sheet 1：學生名單
+    // ══════════════════════════════════════════
+    const ws = wb.addWorksheet('學生名單', {
+      views: [{ state: 'frozen', ySplit: 3 }],
+    });
 
-    // ── 學生名單 Sheet ──
-    const headers = ['route_name','bus_name','driver_name','driver_phone','student_name','student_code','class_name','parent_name','parent_phone'];
-    const headerLabels = ['路線名稱','車次名稱','司機姓名','司機手機','學生姓名','學生證號','班級','家長姓名','家長手機'];
-    const notes = ['選填','必填','選填','選填（司機帳號）','必填','選填（掃描用）','選填','必填','必填（家長帳號）'];
-
-    const wsData: any[][] = [
-      // 第一列：欄位英文名
-      headers,
-      // 第二列：欄位中文說明
-      headerLabels,
-      // 第三列：備註
-      notes,
-      // 空白分隔
+    const headers = [
+      { key: 'route_name',   label: '路線名稱', note: '選填，如：觀音線',               width: 14 },
+      { key: 'bus_name',     label: '車次名稱', note: '必填，如：觀音線01',              width: 16 },
+      { key: 'driver_name',  label: '司機姓名', note: '選填',                           width: 13 },
+      { key: 'driver_phone', label: '司機手機', note: '選填（司機帳號，密碼=後4碼）',    width: 22 },
+      { key: 'student_name', label: '學生姓名', note: '必填',                           width: 13 },
+      { key: 'student_code', label: '學生證號', note: '選填（用於掃描上車）',            width: 16 },
+      { key: 'class_name',   label: '班級',     note: '選填，如：三年二班',              width: 13 },
+      { key: 'parent_name',  label: '家長姓名', note: '必填',                           width: 13 },
+      { key: 'parent_phone', label: '家長手機', note: '必填（家長帳號，密碼=後4碼）',    width: 22 },
     ];
 
-    // 加入資料
-    if (rows.length > 0) {
-      rows.forEach((r: any) => {
-        wsData.push(headers.map(h => r[h] || ''));
+    // 欄寬
+    ws.columns = headers.map(h => ({ width: h.width }));
+
+    // 第一列：標題說明列（合併）
+    ws.mergeCells('A1:I1');
+    const titleCell = ws.getCell('A1');
+    titleCell.value = `📋 校車學生資料庫　｜　必填：bus_name / student_name / parent_name / parent_phone　｜　共 ${rows.length} 筆`;
+    titleCell.font = { name: 'Microsoft JhengHei', size: 12, bold: true, color: { argb: 'FFFFFFFF' } };
+    titleCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0A1628' } };
+    titleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+    ws.getRow(1).height = 30;
+
+    // 第二列：英文欄位名稱
+    const row2 = ws.getRow(2);
+    headers.forEach((h, i) => {
+      const cell = row2.getCell(i + 1);
+      cell.value = h.key;
+      cell.font = { name: 'Microsoft JhengHei', size: 11, bold: true, color: { argb: 'FFFFFFFF' } };
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E3A6E' } };
+      cell.alignment = { horizontal: 'center', vertical: 'middle' };
+      cell.border = {
+        top: { style: 'thin', color: { argb: 'FF334155' } },
+        bottom: { style: 'thin', color: { argb: 'FF334155' } },
+        left: { style: 'thin', color: { argb: 'FF334155' } },
+        right: { style: 'thin', color: { argb: 'FF334155' } },
+      };
+    });
+    row2.height = 24;
+
+    // 第三列：中文說明 + 備註
+    const row3 = ws.getRow(3);
+    headers.forEach((h, i) => {
+      const cell = row3.getCell(i + 1);
+      cell.value = `${h.label}　${h.note}`;
+      cell.font = { name: 'Microsoft JhengHei', size: 10, color: { argb: 'FFFCD34D' } };
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A1000' } };
+      cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+      cell.border = {
+        top: { style: 'thin', color: { argb: 'FF334155' } },
+        bottom: { style: 'thin', color: { argb: 'FF334155' } },
+        left: { style: 'thin', color: { argb: 'FF334155' } },
+        right: { style: 'thin', color: { argb: 'FF334155' } },
+      };
+    });
+    row3.height = 32;
+
+    // 資料列
+    const dataRows = rows.length > 0 ? rows : [
+      { route_name: '觀音線', bus_name: '觀音線01', driver_name: '陳大明', driver_phone: '0912345678', student_name: '王小明', student_code: 'S001', class_name: '三年二班', parent_name: '王爸爸', parent_phone: '0911111111' },
+      { route_name: '觀音線', bus_name: '觀音線01', driver_name: '陳大明', driver_phone: '0912345678', student_name: '李小美', student_code: 'S002', class_name: '四年一班', parent_name: '李媽媽', parent_phone: '0922222222' },
+    ];
+
+    dataRows.forEach((r: any, idx: number) => {
+      const row = ws.addRow(headers.map(h => r[h.key] || ''));
+      const isEven = idx % 2 === 0;
+      row.eachCell((cell: any) => {
+        cell.font = { name: 'Microsoft JhengHei', size: 11, color: { argb: 'FFE2E8F0' } };
+        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: isEven ? 'FF0D1F35' : 'FF091828' } };
+        cell.alignment = { horizontal: 'center', vertical: 'middle' };
+        cell.border = {
+          top: { style: 'thin', color: { argb: 'FF1E3A5F' } },
+          bottom: { style: 'thin', color: { argb: 'FF1E3A5F' } },
+          left: { style: 'thin', color: { argb: 'FF1E3A5F' } },
+          right: { style: 'thin', color: { argb: 'FF1E3A5F' } },
+        };
       });
-    } else {
-      // 沒有資料時放範例
-      wsData.push(['觀音線','觀音線01','陳大明','0912345678','王小明','S001','三年二班','王爸爸','0911111111']);
-      wsData.push(['觀音線','觀音線01','陳大明','0912345678','李小美','S002','四年一班','李媽媽','0922222222']);
-    }
+      row.height = 22;
+    });
 
-    const ws = XLSX.utils.aoa_to_sheet(wsData);
+    // ══════════════════════════════════════════
+    // Sheet 2：填寫說明
+    // ══════════════════════════════════════════
+    const ws2 = wb.addWorksheet('填寫說明');
+    ws2.columns = [{ width: 20 }, { width: 58 }];
 
-    // 欄寬設定
-    ws['!cols'] = [
-      { wch: 12 }, { wch: 14 }, { wch: 12 }, { wch: 18 },
-      { wch: 12 }, { wch: 14 }, { wch: 12 }, { wch: 12 }, { wch: 18 }
+    const instructions = [
+      { type: 'title', text: '填寫說明' },
+      { type: 'empty' },
+      { type: 'section', text: '【必填欄位】' },
+      { type: 'item', key: 'bus_name',      val: '車次名稱，例如：觀音線01、大園線01' },
+      { type: 'item', key: 'student_name',  val: '學生姓名' },
+      { type: 'item', key: 'parent_name',   val: '家長姓名' },
+      { type: 'item', key: 'parent_phone',  val: '家長手機號碼（作為家長登入帳號，密碼預設為手機後4碼）' },
+      { type: 'empty' },
+      { type: 'section', text: '【選填欄位】' },
+      { type: 'item', key: 'route_name',    val: '路線名稱，例如：觀音線、大園線' },
+      { type: 'item', key: 'driver_name',   val: '司機姓名' },
+      { type: 'item', key: 'driver_phone',  val: '司機手機號碼（作為司機登入帳號，密碼預設為手機後4碼）' },
+      { type: 'item', key: 'student_code',  val: '學生證號（用於司機掃描學生上車，建議填寫）' },
+      { type: 'item', key: 'class_name',    val: '學生班級，例如：三年二班' },
+      { type: 'empty' },
+      { type: 'section', text: '【匯入邏輯】' },
+      { type: 'item', key: '校車',  val: 'bus_name 不存在 → 自動建立校車' },
+      { type: 'item', key: '司機',  val: 'driver_phone 不存在 → 自動建立司機帳號' },
+      { type: 'item', key: '家長',  val: 'parent_phone 不存在 → 自動建立家長帳號' },
+      { type: 'item', key: '新增',  val: 'student_code 不存在 → 建立新學生' },
+      { type: 'item', key: '更新',  val: 'student_code 已存在 → 更新學生資料' },
+      { type: 'empty' },
+      { type: 'section', text: '【注意事項】' },
+      { type: 'item', key: '1.',  val: '同一台校車的學生，bus_name 要完全一致（包含空格）' },
+      { type: 'item', key: '2.',  val: '家長手機號碼作為帳號，不可重複' },
+      { type: 'item', key: '3.',  val: '第4行起填寫實際資料，可刪除範例資料' },
+      { type: 'item', key: '匯出時間', val: new Date().toLocaleString('zh-TW') },
+      { type: 'item', key: '資料筆數', val: `${rows.length} 筆學生資料` },
     ];
 
-    // 凍結前三列（欄位說明）
-    ws['!freeze'] = { xSplit: 0, ySplit: 3 };
+    instructions.forEach((inst: any) => {
+      if (inst.type === 'empty') { ws2.addRow([]); return; }
+      const row = ws2.addRow([inst.text || inst.key, inst.val || '']);
+      if (inst.type === 'title') {
+        row.getCell(1).font = { name: 'Microsoft JhengHei', size: 16, bold: true, color: { argb: 'FF1E40AF' } };
+        row.height = 30;
+      } else if (inst.type === 'section') {
+        row.getCell(1).font = { name: 'Microsoft JhengHei', size: 12, bold: true, color: { argb: 'FF1D4ED8' } };
+        row.getCell(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFDBEAFE' } };
+        ws2.mergeCells(`A${row.number}:B${row.number}`);
+        row.height = 22;
+      } else {
+        row.getCell(1).font = { name: 'Microsoft JhengHei', size: 10, bold: true, color: { argb: 'FF374151' } };
+        row.getCell(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF3F4F6' } };
+        row.getCell(2).font = { name: 'Microsoft JhengHei', size: 10, color: { argb: 'FF111827' } };
+        row.height = 20;
+      }
+    });
 
-    XLSX.utils.book_append_sheet(wb, ws, '學生名單');
-
-    // ── 填寫說明 Sheet ──
-    const ws2Data = [
-      ['填寫說明', ''],
-      ['', ''],
-      ['【必填欄位】', ''],
-      ['bus_name', '車次名稱，例如：觀音線01、大園線01'],
-      ['student_name', '學生姓名'],
-      ['parent_name', '家長姓名'],
-      ['parent_phone', '家長手機號碼（作為家長登入帳號，密碼預設為手機後4碼）'],
-      ['', ''],
-      ['【選填欄位】', ''],
-      ['route_name', '路線名稱，例如：觀音線、大園線'],
-      ['driver_name', '司機姓名'],
-      ['driver_phone', '司機手機號碼（作為司機登入帳號，密碼預設為手機後4碼）'],
-      ['student_code', '學生證號（用於司機掃描學生上車，建議填寫）'],
-      ['class_name', '學生班級，例如：三年二班'],
-      ['', ''],
-      ['【匯入邏輯】', ''],
-      ['校車', 'bus_name 不存在 → 自動建立校車'],
-      ['司機', 'driver_phone 不存在 → 自動建立司機帳號'],
-      ['家長', 'parent_phone 不存在 → 自動建立家長帳號'],
-      ['學生', 'student_code 不存在 → 建立新學生'],
-      ['更新', 'student_code 已存在 → 更新學生資料'],
-      ['', ''],
-      ['【注意事項】', ''],
-      ['1.', '同一台校車的學生，bus_name 要完全一致'],
-      ['2.', '家長手機號碼作為帳號，不可重複'],
-      ['3.', '第4行起填寫實際資料，可刪除範例資料'],
-      ['4.', `匯出時間：${new Date().toLocaleString('zh-TW')}`],
-      ['5.', `共 ${rows.length} 筆學生資料`],
-    ];
-
-    const ws2 = XLSX.utils.aoa_to_sheet(ws2Data);
-    ws2['!cols'] = [{ wch: 18 }, { wch: 55 }];
-    XLSX.utils.book_append_sheet(wb, ws2, '填寫說明');
-
-    // 輸出 buffer
-    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
-
+    // 輸出
     const today = new Date().toLocaleDateString('zh-TW').replace(/\//g, '');
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''%E6%A0%A1%E8%BB%8A%E5%AD%B8%E7%94%9F%E8%B3%87%E6%96%99%E5%BA%AB_${today}.xlsx`);
-    res.send(buf);
-  } catch (e) {
+
+    await wb.xlsx.write(res);
+    res.end();
+  } catch (e: any) {
+    console.error('Export error:', e);
     res.status(500).json({ error: String(e) });
   }
 });
