@@ -840,16 +840,19 @@ app.get('/api/admin/history/stats', auth(['admin']), async (req, res) => {
   try {
     const [rows]: any = await pool.query(`
       SELECT
-        b.bus_name, b.route_name,
+        b.id as bus_id, b.bus_name, b.route_name,
         COUNT(DISTINCT ds.id) as total_sessions,
         COUNT(DISTINCT DATE(ds.session_date)) as active_days,
-        SUM(SELECT COUNT(*) FROM boarding_records br WHERE br.session_id = ds.id) as total_boardings,
-        AVG(SELECT COUNT(*) FROM boarding_records br WHERE br.session_id = ds.id) as avg_boardings,
+        COALESCE(SUM(br_count.cnt), 0) as total_boardings,
+        COALESCE(AVG(br_count.cnt), 0) as avg_boardings,
         (SELECT COUNT(*) FROM students s WHERE s.bus_id = b.id AND s.is_active = 1) as enrolled_students
       FROM buses b
       LEFT JOIN driver_sessions ds ON ds.bus_id = b.id
         AND ds.session_date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
         AND ds.end_time IS NOT NULL
+      LEFT JOIN (
+        SELECT session_id, COUNT(*) as cnt FROM boarding_records GROUP BY session_id
+      ) br_count ON br_count.session_id = ds.id
       GROUP BY b.id, b.bus_name, b.route_name
       ORDER BY b.route_name, b.bus_name
     `, [Number(days)]);
