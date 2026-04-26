@@ -748,6 +748,21 @@ app.get('/api/admin/export', auth(['admin']), async (_req, res) => {
 });
 
 
+
+// PUT /api/admin/students/:id — 修改學生資料（含校車）
+app.put('/api/admin/students/:id', auth(['admin']), async (req: AuthRequest, res) => {
+  const id = Number(req.params.id);
+  const { name, school_class, bus_id, parent_id } = req.body;
+  if (isNaN(id)) return res.status(400).json({ error: '無效的 ID' });
+  try {
+    await pool.query(
+      `UPDATE students SET name=?, school_class=?, bus_id=?, parent_id=? WHERE id=?`,
+      [name, school_class, bus_id, parent_id, id]
+    );
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: String(e) }); }
+});
+
 // ══════════════════════════════════════════════════════
 // 路線管理 API
 // ══════════════════════════════════════════════════════
