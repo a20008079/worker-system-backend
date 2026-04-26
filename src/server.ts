@@ -1,4 +1,4 @@
-// src/server.ts — 校車定位管理系統後端
+// src/server.ts — 校車定位管理系統後端（含自動下線）
 import express, { Request, Response, NextFunction } from 'express';
 import mysql from 'mysql2/promise';
 import cors from 'cors';
@@ -43,6 +43,59 @@ function auth(roles: string[]) {
     }
   };
 }
+
+// ══════════════════════════════════════════════════════
+// 自動下線機制
+// 規則：司機上線後，若超過 N 分鐘沒有回傳 GPS 定位，
+//        系統自動幫他下線（避免家長一直看到「行駛中」）
+// ══════════════════════════════════════════════════════
+const AUTO_OFFLINE_MINUTES = 30; // 超過 30 分鐘無 GPS 更新 → 自動下線
+
+async function autoOfflineCheck() {
+  try {
+    // 找出：今天仍在線（end_time IS NULL）但超過 N 分鐘沒有 GPS 更新的 session
+    const [sessions]: any = await pool.query(`
+      SELECT ds.id, ds.driver_id, ds.bus_id, d.name as driver_name, b.bus_name
+      FROM driver_sessions ds
+      JOIN drivers d ON ds.driver_id = d.id
+      JOIN buses b ON ds.bus_id = b.id
+      WHERE ds.session_date = CURDATE()
+        AND ds.end_time IS NULL
+        AND (
+          -- 從未傳過 GPS，且上線超過 N 分鐘
+          NOT EXISTS (
+            SELECT 1 FROM bus_locations bl WHERE bl.session_id = ds.id
+          ) AND ds.created_at < DATE_SUB(NOW(), INTERVAL ${AUTO_OFFLINE_MINUTES} MINUTE)
+          OR
+          -- 傳過 GPS，但最後一次超過 N 分鐘前
+          EXISTS (
+            SELECT 1 FROM bus_locations bl WHERE bl.session_id = ds.id
+          ) AND (
+            SELECT MAX(bl2.created_at) FROM bus_locations bl2 WHERE bl2.session_id = ds.id
+          ) < DATE_SUB(NOW(), INTERVAL ${AUTO_OFFLINE_MINUTES} MINUTE)
+        )
+    `);
+
+    if (sessions.length > 0) {
+      const ids = sessions.map((s: any) => s.id);
+      const ph = ids.map(() => '?').join(',');
+      await pool.query(
+        `UPDATE driver_sessions SET end_time = NOW() WHERE id IN (${ph})`,
+        ids
+      );
+      sessions.forEach((s: any) => {
+        console.log(`[自動下線] ${s.driver_name} / ${s.bus_name} (session_id: ${s.id}) — 超過 ${AUTO_OFFLINE_MINUTES} 分鐘無 GPS`);
+      });
+    }
+  } catch (e) {
+    console.error('[自動下線] 檢查失敗:', e);
+  }
+}
+
+// 每 5 分鐘檢查一次
+setInterval(autoOfflineCheck, 5 * 60 * 1000);
+// 啟動時也立即執行一次
+autoOfflineCheck();
 
 // ══════════════════════════════════════════════════════
 // AUTH
@@ -248,7 +301,7 @@ app.get('/api/bus/:busId/location', auth(['parent', 'admin']), async (req: AuthR
 // ══════════════════════════════════════════════════════
 // Health Check
 // ══════════════════════════════════════════════════════
-app.get('/health', (_req, res) => res.json({ ok: true }));
+app.get('/health', (_req, res) => res.json({ ok: true, autoOfflineMinutes: AUTO_OFFLINE_MINUTES }));
 
 // ══════════════════════════════════════════════════════
 // 管理員端 - 校車管理
@@ -270,7 +323,6 @@ app.get('/api/admin/buses', auth(['admin']), async (_req, res) => {
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
-// PUT /api/admin/buses/:busId/driver — 指派司機到校車
 app.put('/api/admin/buses/:busId/driver', auth(['admin']), async (req, res) => {
   const busId = Number(req.params.busId);
   const { driver_id } = req.body;
@@ -280,19 +332,16 @@ app.put('/api/admin/buses/:busId/driver', auth(['admin']), async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
-// GET /api/admin/buses/locations — 所有校車即時位置（管理員地圖用）
 app.get('/api/admin/buses/locations', auth(['admin']), async (_req, res) => {
   try {
     const [rows]: any = await pool.query(`
-      SELECT
-        b.id, b.bus_name, b.route_name,
-        d.name AS driver_name, d.account AS driver_account,
-        bl.latitude, bl.longitude, bl.created_at AS last_seen,
-        (SELECT id FROM driver_sessions ds WHERE ds.bus_id = b.id AND ds.session_date = CURDATE() AND ds.end_time IS NULL LIMIT 1) AS session_id,
-        (SELECT COUNT(*) FROM students s WHERE s.bus_id = b.id AND s.is_active = 1) AS student_count,
-        (SELECT COUNT(*) FROM boarding_records br
-         JOIN driver_sessions ds ON br.session_id = ds.id
-         WHERE ds.bus_id = b.id AND ds.session_date = CURDATE() AND ds.end_time IS NULL) AS boarded_count
+      SELECT b.id, b.bus_name, b.route_name,
+             d.name AS driver_name, d.account AS driver_account,
+             bl.latitude, bl.longitude, bl.created_at AS last_seen,
+             (SELECT id FROM driver_sessions ds WHERE ds.bus_id = b.id AND ds.session_date = CURDATE() AND ds.end_time IS NULL LIMIT 1) AS session_id,
+             (SELECT COUNT(*) FROM students s WHERE s.bus_id = b.id AND s.is_active = 1) AS student_count,
+             (SELECT COUNT(*) FROM boarding_records br JOIN driver_sessions ds ON br.session_id = ds.id
+              WHERE ds.bus_id = b.id AND ds.session_date = CURDATE() AND ds.end_time IS NULL) AS boarded_count
       FROM buses b
       LEFT JOIN drivers d ON b.driver_id = d.id
       LEFT JOIN bus_locations bl ON bl.id = (SELECT id FROM bus_locations WHERE bus_id = b.id ORDER BY created_at DESC LIMIT 1)
@@ -303,15 +352,12 @@ app.get('/api/admin/buses/locations', auth(['admin']), async (_req, res) => {
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
-// GET /api/admin/buses/:busId/history — 某台校車今日行駛路徑
 app.get('/api/admin/buses/:busId/history', auth(['admin', 'parent']), async (req, res) => {
   const busId = Number(req.params.busId);
   try {
     const [rows]: any = await pool.query(
-      `SELECT latitude, longitude, created_at
-       FROM bus_locations
-       WHERE bus_id = ? AND DATE(created_at) = CURDATE()
-       ORDER BY created_at ASC`, [busId]
+      `SELECT latitude, longitude, created_at FROM bus_locations
+       WHERE bus_id = ? AND DATE(created_at) = CURDATE() ORDER BY created_at ASC`, [busId]
     );
     res.json(rows);
   } catch (e) { res.status(500).json({ error: String(e) }); }
@@ -348,7 +394,6 @@ app.post('/api/admin/students', auth(['admin']), async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
-// DELETE /api/admin/students/:id — 刪除學生（含外鍵清理）
 app.delete('/api/admin/students/:id', auth(['admin']), async (req, res) => {
   const id = Number(req.params.id);
   const conn = await pool.getConnection();
@@ -386,8 +431,8 @@ app.get('/api/admin/scan/:code', auth(['admin', 'driver']), async (req: AuthRequ
        FROM students s LEFT JOIN parents p ON s.parent_id = p.id LEFT JOIN buses b ON s.bus_id = b.id
        WHERE s.student_code = ? OR s.card_code = ? LIMIT 1`, [code, code]
     );
-    if (rows[0]) { res.json({ found: true, student: rows[0] }); }
-    else { res.json({ found: false, scanned_code: code }); }
+    if (rows[0]) res.json({ found: true, student: rows[0] });
+    else res.json({ found: false, scanned_code: code });
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
@@ -549,7 +594,6 @@ app.put('/api/admin/accounts/:role/:id', auth(['admin']), async (req, res) => {
   const { name, account, password, phone, driver_id } = req.body;
   try {
     if (role === 'bus') {
-      // 更新校車（指派司機、修改名稱等）
       if (driver_id !== undefined) await pool.query(`UPDATE buses SET driver_id = ? WHERE id = ?`, [driver_id || null, id]);
       if (name) await pool.query(`UPDATE buses SET bus_name = ? WHERE id = ?`, [name, id]);
     } else if (role === 'driver') {
@@ -575,12 +619,10 @@ app.delete('/api/admin/accounts/:role/:id', auth(['admin']), async (req, res) =>
   try {
     await conn.beginTransaction();
     if (role === 'driver') {
-      // 先解除校車綁定
       await conn.query(`UPDATE buses SET driver_id = NULL WHERE driver_id = ?`, [id]);
       await conn.query(`DELETE FROM driver_sessions WHERE driver_id = ?`, [id]);
       await conn.query(`DELETE FROM drivers WHERE id = ?`, [id]);
     } else if (role === 'parent') {
-      // 先刪學生（含 boarding_records）
       const [stuList]: any = await conn.query(`SELECT id FROM students WHERE parent_id = ?`, [id]);
       for (const s of stuList) {
         await conn.query(`DELETE FROM boarding_records WHERE student_id = ?`, [s.id]);
@@ -600,9 +642,7 @@ app.delete('/api/admin/accounts/:role/:id', auth(['admin']), async (req, res) =>
 });
 
 // ══════════════════════════════════════════════════════
-// 清理 API — 刪除指定校車及其所有關聯資料
-// POST /api/admin/cleanup
-// Body: { bus_names: string[] }
+// 清理 API
 // ══════════════════════════════════════════════════════
 app.post('/api/admin/cleanup', auth(['admin']), async (req, res) => {
   const { bus_names } = req.body;
@@ -635,9 +675,7 @@ app.post('/api/admin/cleanup', auth(['admin']), async (req, res) => {
       await conn.query(`DELETE FROM buses WHERE id IN (${bph})`, busIds);
       deletedBuses = busIds.length;
     }
-    // 清孤立家長（無任何學生）
     await conn.query(`DELETE FROM parents WHERE account IN ('user','0933333333','0922222222','0987654321') AND NOT EXISTS (SELECT 1 FROM students s WHERE s.parent_id = parents.id)`);
-    // 清測試司機
     await conn.query(`DELETE FROM drivers WHERE account = 'bus' AND NOT EXISTS (SELECT 1 FROM buses b WHERE b.driver_id = drivers.id)`);
     await conn.commit();
     res.json({ ok: true, deletedBuses, deletedStudents });
@@ -654,12 +692,9 @@ app.get('/api/admin/export', auth(['admin']), async (_req, res) => {
       `SELECT b.route_name, b.bus_name, d.name as driver_name, d.phone as driver_phone,
               s.name as student_name, s.student_code, s.school_class as class_name,
               p.name as parent_name, p.phone as parent_phone
-       FROM students s
-       LEFT JOIN buses b ON s.bus_id = b.id
-       LEFT JOIN drivers d ON b.driver_id = d.id
-       LEFT JOIN parents p ON s.parent_id = p.id
-       WHERE s.is_active = 1
-       ORDER BY b.route_name, b.bus_name, s.name`
+       FROM students s LEFT JOIN buses b ON s.bus_id = b.id
+       LEFT JOIN drivers d ON b.driver_id = d.id LEFT JOIN parents p ON s.parent_id = p.id
+       WHERE s.is_active = 1 ORDER BY b.route_name, b.bus_name, s.name`
     );
     const ExcelJS = require('exceljs');
     const wb = new ExcelJS.Workbook();
@@ -727,4 +762,5 @@ app.get('/api/admin/export', auth(['admin']), async (_req, res) => {
 app.listen(PORT, () => {
   console.log(`✅ 校車系統 API running on port ${PORT}`);
   console.log(`   TZ=${process.env.TZ || '(未設定)'}`);
+  console.log(`   自動下線：超過 ${AUTO_OFFLINE_MINUTES} 分鐘無 GPS 更新自動下線`);
 });
