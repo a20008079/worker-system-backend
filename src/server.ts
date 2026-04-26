@@ -747,6 +747,58 @@ app.get('/api/admin/export', auth(['admin']), async (_req, res) => {
   } catch (e: any) { res.status(500).json({ error: String(e) }); }
 });
 
+
+// ══════════════════════════════════════════════════════
+// 路線管理 API
+// ══════════════════════════════════════════════════════
+
+// POST /api/admin/buses — 新增校車
+app.post('/api/admin/buses', auth(['admin']), async (req: AuthRequest, res) => {
+  const { bus_name, route_name, driver_id } = req.body;
+  if (!bus_name || !route_name) return res.status(400).json({ error: '請提供 bus_name 和 route_name' });
+  try {
+    const [r]: any = await pool.query(
+      `INSERT INTO buses (bus_name, route_name, driver_id) VALUES (?, ?, ?)`,
+      [bus_name, route_name, driver_id || null]
+    );
+    res.json({ ok: true, id: r.insertId });
+  } catch (e: any) {
+    if (e.code === 'ER_DUP_ENTRY') return res.status(400).json({ error: '車次名稱已存在' });
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// DELETE /api/admin/buses/:id — 刪除單台校車（含學生和出勤紀錄）
+app.delete('/api/admin/buses/:id', auth(['admin']), async (req: AuthRequest, res) => {
+  const busId = Number(req.params.id);
+  if (isNaN(busId)) return res.status(400).json({ error: '無效的校車 ID' });
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    // 找出此校車的學生
+    const [stuList]: any = await conn.query(`SELECT id FROM students WHERE bus_id = ?`, [busId]);
+    const stuIds = stuList.map((s: any) => s.id);
+    if (stuIds.length > 0) {
+      const sph = stuIds.map(() => '?').join(',');
+      await conn.query(`DELETE FROM boarding_records WHERE student_id IN (${sph})`, stuIds);
+      await conn.query(`DELETE FROM students WHERE id IN (${sph})`, stuIds);
+    }
+    // 找出 sessions
+    const [sessions]: any = await conn.query(`SELECT id FROM driver_sessions WHERE bus_id = ?`, [busId]);
+    if (sessions.length > 0) {
+      const sessionIds = sessions.map((s: any) => s.id);
+      await conn.query(`DELETE FROM boarding_records WHERE session_id IN (${sessionIds.map(() => '?').join(',')})`, sessionIds);
+      await conn.query(`DELETE FROM driver_sessions WHERE bus_id = ?`, [busId]);
+    }
+    await conn.query(`DELETE FROM bus_locations WHERE bus_id = ?`, [busId]);
+    await conn.query(`UPDATE buses SET driver_id = NULL WHERE id = ?`, [busId]);
+    await conn.query(`DELETE FROM buses WHERE id = ?`, [busId]);
+    await conn.commit();
+    res.json({ ok: true, deletedStudents: stuIds.length });
+  } catch (e) { await conn.rollback(); res.status(500).json({ error: String(e) }); }
+  finally { conn.release(); }
+});
+
 // ══════════════════════════════════════════════════════
 // Start Server
 // ══════════════════════════════════════════════════════
