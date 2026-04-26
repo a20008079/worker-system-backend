@@ -368,6 +368,7 @@ app.get('/api/admin/students', auth(['admin']), async (_req, res) => {
   try {
     const [rows]: any = await pool.query(
       `SELECT s.id, s.name, s.school_class, s.is_active,
+              s.parent_id, s.bus_id,
               p.name as parent_name, p.account as parent_account,
               b.bus_name, b.route_name
        FROM students s JOIN parents p ON s.parent_id = p.id JOIN buses b ON s.bus_id = b.id
