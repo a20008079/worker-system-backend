@@ -755,3 +755,104 @@ app.listen(PORT, () => {
   console.log(`   TZ=${process.env.TZ || '(未設定)'}`);
   console.log(`   自動下線：超過 ${AUTO_OFFLINE_MINUTES} 分鐘無 GPS 更新自動下線`);
 });
+
+// ══════════════════════════════════════════════════════
+// 歷史紀錄 API
+// ══════════════════════════════════════════════════════
+
+// GET /api/admin/history/sessions?date=2026-04-27&bus_id=4
+// 查詢某日出勤紀錄
+app.get('/api/admin/history/sessions', auth(['admin']), async (req, res) => {
+  const { date, bus_id } = req.query;
+  const targetDate = date || new Date().toISOString().slice(0,10);
+  try {
+    let sql = `
+      SELECT
+        ds.id, ds.session_date, ds.start_time, ds.end_time,
+        d.name as driver_name, d.account as driver_account,
+        b.bus_name, b.route_name,
+        (SELECT COUNT(*) FROM boarding_records br WHERE br.session_id = ds.id) as boarded_count,
+        (SELECT COUNT(*) FROM students s WHERE s.bus_id = ds.bus_id AND s.is_active = 1) as total_students
+      FROM driver_sessions ds
+      JOIN drivers d ON ds.driver_id = d.id
+      JOIN buses b ON ds.bus_id = b.id
+      WHERE DATE(ds.session_date) = ?
+    `;
+    const params: any[] = [targetDate];
+    if (bus_id) { sql += ` AND ds.bus_id = ?`; params.push(bus_id); }
+    sql += ` ORDER BY ds.start_time DESC`;
+    const [rows]: any = await pool.query(sql, params);
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: String(e) }); }
+});
+
+// GET /api/admin/history/boarding?session_id=5
+// 查詢某次出勤的學生上車明細
+app.get('/api/admin/history/boarding', auth(['admin']), async (req, res) => {
+  const { session_id } = req.query;
+  if (!session_id) return res.status(400).json({ error: '請提供 session_id' });
+  try {
+    const [rows]: any = await pool.query(`
+      SELECT
+        s.name as student_name, s.school_class,
+        p.name as parent_name, p.phone as parent_phone,
+        br.boarded_at
+      FROM students s
+      LEFT JOIN parents p ON s.parent_id = p.id
+      LEFT JOIN boarding_records br ON br.student_id = s.id AND br.session_id = ?
+      WHERE s.bus_id = (SELECT bus_id FROM driver_sessions WHERE id = ?)
+        AND s.is_active = 1
+      ORDER BY br.boarded_at ASC, s.school_class, s.name
+    `, [session_id, session_id]);
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: String(e) }); }
+});
+
+// GET /api/admin/history/student?student_name=張詠勝&days=7
+// 查詢某學生近期上車紀錄
+app.get('/api/admin/history/student', auth(['admin']), async (req, res) => {
+  const { student_name, days = 7 } = req.query;
+  if (!student_name) return res.status(400).json({ error: '請提供 student_name' });
+  try {
+    const [rows]: any = await pool.query(`
+      SELECT
+        s.name as student_name, s.school_class,
+        b.bus_name, b.route_name,
+        ds.session_date, ds.start_time,
+        br.boarded_at,
+        CASE WHEN br.boarded_at IS NOT NULL THEN '已上車' ELSE '未上車' END as status
+      FROM students s
+      JOIN buses b ON s.bus_id = b.id
+      JOIN driver_sessions ds ON ds.bus_id = b.id
+        AND ds.session_date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+      LEFT JOIN boarding_records br ON br.student_id = s.id AND br.session_id = ds.id
+      WHERE s.name LIKE ? AND s.is_active = 1
+      ORDER BY ds.session_date DESC, ds.start_time DESC
+    `, [Number(days), `%${student_name}%`]);
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: String(e) }); }
+});
+
+// GET /api/admin/history/stats?days=30
+// 統計報表：各校車出勤率
+app.get('/api/admin/history/stats', auth(['admin']), async (req, res) => {
+  const { days = 30 } = req.query;
+  try {
+    const [rows]: any = await pool.query(`
+      SELECT
+        b.bus_name, b.route_name,
+        COUNT(DISTINCT ds.id) as total_sessions,
+        COUNT(DISTINCT DATE(ds.session_date)) as active_days,
+        SUM(SELECT COUNT(*) FROM boarding_records br WHERE br.session_id = ds.id) as total_boardings,
+        AVG(SELECT COUNT(*) FROM boarding_records br WHERE br.session_id = ds.id) as avg_boardings,
+        (SELECT COUNT(*) FROM students s WHERE s.bus_id = b.id AND s.is_active = 1) as enrolled_students
+      FROM buses b
+      LEFT JOIN driver_sessions ds ON ds.bus_id = b.id
+        AND ds.session_date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+        AND ds.end_time IS NOT NULL
+      GROUP BY b.id, b.bus_name, b.route_name
+      ORDER BY b.route_name, b.bus_name
+    `, [Number(days)]);
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: String(e) }); }
+});
