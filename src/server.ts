@@ -61,19 +61,10 @@ async function autoOfflineCheck() {
       JOIN buses b ON ds.bus_id = b.id
       WHERE ds.session_date = CURDATE()
         AND ds.end_time IS NULL
-        AND (
-          -- 從未傳過 GPS，且上線超過 N 分鐘
-          NOT EXISTS (
-            SELECT 1 FROM bus_locations bl WHERE bl.session_id = ds.id
-          ) AND ds.created_at < DATE_SUB(NOW(), INTERVAL ${AUTO_OFFLINE_MINUTES} MINUTE)
-          OR
-          -- 傳過 GPS，但最後一次超過 N 分鐘前
-          EXISTS (
-            SELECT 1 FROM bus_locations bl WHERE bl.session_id = ds.id
-          ) AND (
-            SELECT MAX(bl2.created_at) FROM bus_locations bl2 WHERE bl2.session_id = ds.id
-          ) < DATE_SUB(NOW(), INTERVAL ${AUTO_OFFLINE_MINUTES} MINUTE)
-        )
+        AND COALESCE(
+          (SELECT MAX(bl.created_at) FROM bus_locations bl WHERE bl.session_id = ds.id),
+          ds.start_time
+        ) < DATE_SUB(NOW(), INTERVAL ${AUTO_OFFLINE_MINUTES} MINUTE)
     `);
 
     if (sessions.length > 0) {
