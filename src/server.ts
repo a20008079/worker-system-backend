@@ -1229,3 +1229,256 @@ app.listen(PORT, () => {
   console.log(`   TZ=${process.env.TZ || '(未設定)'}`);
   console.log(`   自動下線：超過 ${AUTO_OFFLINE_MINUTES} 分鐘無 GPS 更新自動下線`);
 });
+
+// ══════════════════════════════════════════════════════
+// 新學期自動匯入 API
+// POST /api/admin/import-semester
+// 支援 Google 表單 Excel 格式直接匯入
+// 自動：建帳號、填資料、依停車點分配校車
+// ══════════════════════════════════════════════════════
+app.post('/api/admin/import-semester', auth(['admin']), async (req: AuthRequest, res) => {
+  const { rows } = req.body;
+  if (!Array.isArray(rows) || rows.length === 0)
+    return res.status(400).json({ error: '沒有資料' });
+
+  let added = 0, updated = 0, failed = 0, nobus = 0;
+  const errors: string[] = [];
+  const unmatched: any[] = [];
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    // 取得所有校車（含站牌對應）
+    const [buses]: any = await conn.query(
+      `SELECT id, bus_name, route_name, bus_type, capacity,
+              (SELECT COUNT(*) FROM students WHERE bus_id=buses.id AND is_active=1) as student_count
+       FROM buses WHERE is_active=1`
+    );
+
+    // 取得所有停車點對應（bus_stops 表，若存在）
+    let stopMap: Record<string, number> = {};
+    try {
+      const [stops]: any = await conn.query(
+        `SELECT stop_name, bus_id FROM bus_stops`
+      );
+      stops.forEach((s: any) => {
+        stopMap[s.stop_name.trim()] = s.bus_id;
+      });
+    } catch {
+      // bus_stops 表不存在，跳過（之後再加）
+    }
+
+    for (const row of rows) {
+      try {
+        const {
+          class_name, seat_no, student_name,
+          parent_name, parent_phone, address,
+          direction, pickup_location, dropoff_location,
+          dismissal_mon, dismissal_tue, dismissal_wed,
+          dismissal_thu, dismissal_fri
+        } = row;
+
+        if (!student_name || !parent_phone) {
+          failed++;
+          errors.push(`${student_name || '?'}: 缺少姓名或電話`);
+          continue;
+        }
+
+        // 清理時段
+        const cleanSession = (v: string) => {
+          if (!v || v === '不搭') return '不搭';
+          if (String(v).includes('1620')) return '1620';
+          if (String(v).includes('1800')) return '1800';
+          return '不搭';
+        };
+        const mon = cleanSession(dismissal_mon);
+        const tue = cleanSession(dismissal_tue);
+        const wed = cleanSession(dismissal_wed);
+        const thu = cleanSession(dismissal_thu);
+        const fri = cleanSession(dismissal_fri);
+
+        // 搭車方向
+        const dir = String(direction || '').trim();
+        let schoolDir = 'both';
+        if (dir === '上學') schoolDir = 'morning';
+        else if (dir === '放學') schoolDir = 'afternoon';
+        else schoolDir = 'both';
+
+        // 整體放學時段
+        const sessions = [mon, tue, wed, thu, fri].filter(s => s !== '不搭');
+        let dismissalSession: string | null = null;
+        if (sessions.length > 0) {
+          if (sessions.every(s => s === '1620')) dismissalSession = '1620';
+          else if (sessions.every(s => s === '1800')) dismissalSession = '1800';
+          else dismissalSession = 'both';
+        }
+
+        // 搭車星期（從時段判斷）
+        const dayMap: Record<string, string> = { mon: '1', tue: '2', wed: '3', thu: '4', fri: '5' };
+        const activeDays = Object.entries({ mon, tue, wed, thu, fri })
+          .filter(([, v]) => v !== '不搭')
+          .map(([k]) => dayMap[k])
+          .join('');
+
+        // 嘗試依停車點找校車
+        let busId: number | null = null;
+        const pickupClean = String(pickup_location || '').trim();
+        const dropoffClean = String(dropoff_location || '').trim();
+
+        if (stopMap[pickupClean]) busId = stopMap[pickupClean];
+        else if (stopMap[dropoffClean]) busId = stopMap[dropoffClean];
+
+        // 若找不到停車點對應，記錄起來讓管理員確認
+        if (!busId) {
+          nobus++;
+          unmatched.push({
+            student_name,
+            pickup_location: pickupClean,
+            dropoff_location: dropoffClean,
+            parent_phone,
+          });
+          // 仍然建立學生資料，但 bus_id 設為 null（需要後續手動指派）
+        }
+
+        // 建立或更新家長
+        let parentId: number;
+        const [existingParent]: any = await conn.query(
+          `SELECT id FROM parents WHERE phone=? OR account=? LIMIT 1`,
+          [parent_phone, parent_phone]
+        );
+        if (existingParent[0]) {
+          parentId = existingParent[0].id;
+          if (parent_name) {
+            await conn.query(`UPDATE parents SET name=? WHERE id=?`, [parent_name, parentId]);
+          }
+        } else {
+          const [pr]: any = await conn.query(
+            `INSERT INTO parents (name, account, password, phone) VALUES (?, ?, ?, ?)`,
+            [parent_name || parent_phone, parent_phone, parent_phone.slice(-4), parent_phone]
+          );
+          parentId = pr.insertId;
+        }
+
+        // 座位檢查（若有分配到校車）
+        if (busId) {
+          const bus = buses.find((b: any) => b.id === busId);
+          if (bus && bus.student_count >= bus.capacity) {
+            errors.push(`${student_name}: ${bus.bus_name} 已滿（${bus.capacity}人），請手動調整`);
+            busId = null;
+            nobus++;
+          }
+        }
+
+        // 建立或更新學生
+        const [existingStudent]: any = await conn.query(
+          `SELECT id FROM students WHERE name=? AND parent_id=? LIMIT 1`,
+          [student_name, parentId]
+        );
+
+        if (existingStudent[0]) {
+          await conn.query(
+            `UPDATE students SET
+               school_class=?, address=?, pickup_location=?,
+               dropoff_1620=?, dropoff_1800=?,
+               school_direction=?, dismissal_session=?, active_days=?,
+               dismissal_mon=?, dismissal_tue=?, dismissal_wed=?,
+               dismissal_thu=?, dismissal_fri=?,
+               bus_id=COALESCE(?,bus_id)
+             WHERE id=?`,
+            [
+              class_name, address, pickupClean,
+              dropoffClean, dropoffClean,
+              schoolDir, dismissalSession, activeDays || '12345',
+              mon, tue, wed, thu, fri,
+              busId, existingStudent[0].id
+            ]
+          );
+          updated++;
+        } else {
+          await conn.query(
+            `INSERT INTO students
+               (name, school_class, parent_id, bus_id, address,
+                pickup_location, dropoff_1620, dropoff_1800,
+                school_direction, dismissal_session, active_days,
+                dismissal_mon, dismissal_tue, dismissal_wed, dismissal_thu, dismissal_fri,
+                parent_phone)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            [
+              student_name, class_name, parentId, busId, address,
+              pickupClean, dropoffClean, dropoffClean,
+              schoolDir, dismissalSession, activeDays || '12345',
+              mon, tue, wed, thu, fri,
+              parent_phone
+            ]
+          );
+          added++;
+        }
+
+        // 更新 bus 的 student_count 計數（in-memory）
+        if (busId) {
+          const bus = buses.find((b: any) => b.id === busId);
+          if (bus) bus.student_count++;
+        }
+
+      } catch (e: any) {
+        failed++;
+        errors.push(`${row.student_name || '?'}: ${e.message}`);
+      }
+    }
+
+    await conn.commit();
+    res.json({
+      ok: true,
+      added, updated, failed, nobus,
+      errors,
+      unmatched, // 需要手動指派校車的學生
+      summary: `新增 ${added} 人，更新 ${updated} 人，失敗 ${failed} 人，待分配校車 ${nobus} 人`
+    });
+  } catch (e) {
+    await conn.rollback();
+    res.status(500).json({ error: String(e) });
+  } finally {
+    conn.release();
+  }
+});
+
+// ══════════════════════════════════════════════════════
+// 停車點管理 API（為之後路線對應準備）
+// ══════════════════════════════════════════════════════
+app.get('/api/admin/bus-stops', auth(['admin']), async (_req, res) => {
+  try {
+    const [rows]: any = await pool.query(
+      `SELECT bs.id, bs.stop_name, bs.bus_id, b.bus_name, b.route_name
+       FROM bus_stops bs JOIN buses b ON bs.bus_id = b.id
+       ORDER BY b.route_name, b.bus_name, bs.stop_name`
+    );
+    res.json(rows);
+  } catch {
+    res.json([]); // 表不存在時回傳空陣列
+  }
+});
+
+app.post('/api/admin/bus-stops', auth(['admin']), async (req, res) => {
+  const { stop_name, bus_id } = req.body;
+  if (!stop_name || !bus_id) return res.status(400).json({ error: '缺少資料' });
+  try {
+    const [r]: any = await pool.query(
+      `INSERT INTO bus_stops (stop_name, bus_id) VALUES (?, ?)
+       ON DUPLICATE KEY UPDATE bus_id=?`,
+      [stop_name.trim(), bus_id, bus_id]
+    );
+    res.json({ ok: true, id: r.insertId });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.delete('/api/admin/bus-stops/:id', auth(['admin']), async (req, res) => {
+  try {
+    await pool.query(`DELETE FROM bus_stops WHERE id=?`, [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
