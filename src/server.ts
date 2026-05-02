@@ -283,7 +283,10 @@ app.get('/api/parent/me', auth(['parent']), async (req: AuthRequest, res) => {
   try {
     const [students]: any = await pool.query(
       `SELECT s.id, s.name, s.school_class,
-              s.pickup_location, s.dropoff_1620, s.dropoff_1800, s.dismissal_session, s.active_days,
+              s.pickup_location, s.dropoff_1620, s.dropoff_1800,
+              s.dismissal_session, s.active_days,
+              s.school_direction,
+              s.dismissal_mon, s.dismissal_tue, s.dismissal_wed, s.dismissal_thu, s.dismissal_fri,
               b.id as bus_id, b.bus_name, b.route_name
        FROM students s JOIN buses b ON s.bus_id = b.id
        WHERE s.parent_id = ? AND s.is_active = 1`,
@@ -312,7 +315,11 @@ app.get('/api/parent/me', auth(['parent']), async (req: AuthRequest, res) => {
           id: student.id, name: student.name, school_class: student.school_class,
           pickup_location: student.pickup_location,
           dropoff_1620: student.dropoff_1620, dropoff_1800: student.dropoff_1800,
-          dismissal_session: student.dismissal_session, active_days: student.active_days
+          dismissal_session: student.dismissal_session, active_days: student.active_days,
+          school_direction: student.school_direction,
+          dismissal_mon: student.dismissal_mon, dismissal_tue: student.dismissal_tue,
+          dismissal_wed: student.dismissal_wed, dismissal_thu: student.dismissal_thu,
+          dismissal_fri: student.dismissal_fri
         },
         bus: { id: student.bus_id, bus_name: student.bus_name, route_name: student.route_name },
         location: locs[0] || null,
@@ -473,6 +480,8 @@ app.get('/api/admin/students', auth(['admin']), async (_req, res) => {
       SELECT s.id, s.name, s.school_class, s.is_active, s.parent_id, s.bus_id,
              s.address, s.pickup_location, s.dropoff_1620, s.dropoff_1800,
              s.dismissal_session, s.active_days,
+             s.school_direction,
+             s.dismissal_mon, s.dismissal_tue, s.dismissal_wed, s.dismissal_thu, s.dismissal_fri,
              p.name as parent_name, p.account as parent_account,
              b.bus_name, b.route_name, b.bus_type, b.capacity,
              (SELECT COUNT(*) FROM students ss WHERE ss.bus_id = s.bus_id AND ss.is_active = 1) as bus_student_count
@@ -490,7 +499,9 @@ app.get('/api/admin/students', auth(['admin']), async (_req, res) => {
 app.post('/api/admin/students', auth(['admin']), async (req, res) => {
   const { name, school_class, parent_id, bus_id,
           address, pickup_location, dropoff_1620, dropoff_1800,
-          dismissal_session, active_days } = req.body;
+          dismissal_session, active_days,
+          school_direction,
+          dismissal_mon, dismissal_tue, dismissal_wed, dismissal_thu, dismissal_fri } = req.body;
   try {
     // 座位上限檢查
     const [cap]: any = await pool.query(
@@ -505,12 +516,16 @@ app.post('/api/admin/students', auth(['admin']), async (req, res) => {
     const [r]: any = await pool.query(
       `INSERT INTO students
          (name, school_class, parent_id, bus_id, address, pickup_location,
-          dropoff_1620, dropoff_1800, dismissal_session, active_days)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          dropoff_1620, dropoff_1800, dismissal_session, active_days,
+          school_direction, dismissal_mon, dismissal_tue, dismissal_wed, dismissal_thu, dismissal_fri)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [name, school_class, parent_id, bus_id,
        address || null, pickup_location || null,
        dropoff_1620 || null, dropoff_1800 || null,
-       dismissal_session || null, active_days || '12345']
+       dismissal_session || null, active_days || '12345',
+       school_direction || null,
+       dismissal_mon || null, dismissal_tue || null, dismissal_wed || null,
+       dismissal_thu || null, dismissal_fri || null]
     );
     res.json({ id: r.insertId });
   } catch (e) {
@@ -522,7 +537,9 @@ app.put('/api/admin/students/:id', auth(['admin']), async (req: AuthRequest, res
   const id = Number(req.params.id);
   const { name, school_class, bus_id, parent_id,
           address, pickup_location, dropoff_1620, dropoff_1800,
-          dismissal_session, active_days } = req.body;
+          dismissal_session, active_days,
+          school_direction,
+          dismissal_mon, dismissal_tue, dismissal_wed, dismissal_thu, dismissal_fri } = req.body;
   if (isNaN(id))  return res.status(400).json({ error: '無效的 ID' });
   if (!bus_id)    return res.status(400).json({ error: '請選擇校車' });
   try {
@@ -543,12 +560,17 @@ app.put('/api/admin/students/:id', auth(['admin']), async (req: AuthRequest, res
       `UPDATE students SET
          name=?, school_class=?, bus_id=?, parent_id=?,
          address=?, pickup_location=?, dropoff_1620=?, dropoff_1800=?,
-         dismissal_session=?, active_days=?
+         dismissal_session=?, active_days=?,
+         school_direction=?,
+         dismissal_mon=?, dismissal_tue=?, dismissal_wed=?, dismissal_thu=?, dismissal_fri=?
        WHERE id=?`,
       [name, school_class, Number(bus_id), parent_id,
        address || null, pickup_location || null,
        dropoff_1620 || null, dropoff_1800 || null,
-       dismissal_session || null, active_days || '12345', id]
+       dismissal_session || null, active_days || '12345',
+       school_direction || null,
+       dismissal_mon || null, dismissal_tue || null, dismissal_wed || null,
+       dismissal_thu || null, dismissal_fri || null, id]
     );
     res.json({ ok: true });
   } catch (e) {
@@ -963,6 +985,8 @@ app.get('/api/admin/export', auth(['admin']), async (_req, res) => {
              s.name as student_name, s.student_code, s.school_class as class_name,
              s.address, s.pickup_location, s.dropoff_1620, s.dropoff_1800,
              s.dismissal_session, s.active_days,
+             s.school_direction,
+             s.dismissal_mon, s.dismissal_tue, s.dismissal_wed, s.dismissal_thu, s.dismissal_fri,
              p.name as parent_name, p.phone as parent_phone
       FROM students s
       LEFT JOIN buses b ON s.bus_id = b.id
