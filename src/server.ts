@@ -303,12 +303,19 @@ app.get('/api/parent/me', auth(['parent']), async (req: AuthRequest, res) => {
       );
       const sessionId = sessions[0]?.id || null;
       let boarded_at = null;
+      let alighted_at = null;
       if (sessionId) {
         const [boarding]: any = await pool.query(
           `SELECT boarded_at FROM boarding_records WHERE student_id = ? AND session_id = ? LIMIT 1`,
           [student.id, sessionId]
         );
         boarded_at = boarding[0]?.boarded_at || null;
+
+        const [alighting]: any = await pool.query(
+          `SELECT alighted_at FROM alighting_records WHERE student_id = ? AND session_id = ? LIMIT 1`,
+          [student.id, sessionId]
+        );
+        alighted_at = alighting[0]?.alighted_at || null;
       }
       return {
         student: {
@@ -325,6 +332,7 @@ app.get('/api/parent/me', auth(['parent']), async (req: AuthRequest, res) => {
         location: locs[0] || null,
         is_online: sessions.length > 0,
         boarded_at,
+        alighted_at,
       };
     }));
     res.json(result);
@@ -1219,6 +1227,75 @@ app.get('/api/admin/history/stats', auth(['admin']), async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
+});
+
+
+// ══════════════════════════════════════════════════════
+// 下車掃描 API
+// ══════════════════════════════════════════════════════
+app.post('/api/driver/scan-alight', auth(['driver']), async (req: AuthRequest, res) => {
+  const driverId = req.user!.id;
+  const { code } = req.body;
+  try {
+    const [sessions]: any = await pool.query(
+      `SELECT ds.id, ds.bus_id FROM driver_sessions ds
+       WHERE ds.driver_id = ? AND ds.session_date = CURDATE() AND ds.end_time IS NULL LIMIT 1`,
+      [driverId]
+    );
+    const session = sessions[0];
+    if (!session) return res.status(400).json({ error: '請先上線' });
+
+    const [students]: any = await pool.query(
+      `SELECT s.id, s.name, s.school_class, s.bus_id,
+              s.pickup_location, s.dropoff_1620, s.dropoff_1800, s.dismissal_session,
+              s.dismissal_mon, s.dismissal_tue, s.dismissal_wed, s.dismissal_thu, s.dismissal_fri,
+              p.name as parent_name, p.phone as parent_phone
+       FROM students s LEFT JOIN parents p ON s.parent_id = p.id
+       WHERE s.student_code = ? OR s.card_code = ? LIMIT 1`,
+      [code, code]
+    );
+    const student = students[0];
+    if (!student) return res.json({ status: 'not_found', message: '查無學生，請聯絡管理員' });
+    if (student.bus_id !== session.bus_id)
+      return res.json({ status: 'wrong_bus', message: `${student.name} 不是本車學生`, student });
+
+    // 確認有上車記錄
+    const [boarding]: any = await pool.query(
+      `SELECT id FROM boarding_records WHERE student_id = ? AND session_id = ? LIMIT 1`,
+      [student.id, session.id]
+    );
+    if (!boarding[0])
+      return res.json({ status: 'not_boarded', message: `${student.name} 尚未上車記錄`, student });
+
+    // 記錄下車
+    await pool.query(
+      `INSERT INTO alighting_records (student_id, session_id) VALUES (?, ?)
+       ON DUPLICATE KEY UPDATE alighted_at = NOW()`,
+      [student.id, session.id]
+    );
+
+    // 取得今天放學地點
+    const dayOfWeek = new Date().getDay();
+    const dayKeys: Record<number, string> = { 1: 'dismissal_mon', 2: 'dismissal_tue', 3: 'dismissal_wed', 4: 'dismissal_thu', 5: 'dismissal_fri' };
+    const todaySession = dayKeys[dayOfWeek] ? student[dayKeys[dayOfWeek]] : null;
+    const dropoffLocation = todaySession === '1620' ? student.dropoff_1620 : student.dropoff_1800;
+
+    res.json({
+      status: 'ok',
+      message: `${student.name} 下車成功`,
+      student,
+      dropoff_location: dropoffLocation,
+      today_session: todaySession,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// 取得下車記錄（給家長和管理員）
+app.get('/api/driver/students', auth(['driver']), async (req: AuthRequest, res) => {
+  // 此路由已在上方定義，這裡補充下車資訊版本
+  res.status(404).json({ error: 'use /api/driver/students' });
 });
 
 // ══════════════════════════════════════════════════════
