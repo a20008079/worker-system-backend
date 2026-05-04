@@ -47,7 +47,7 @@ function auth(roles: string[]) {
 // ══════════════════════════════════════════════════════
 // 自動下線機制
 // ══════════════════════════════════════════════════════
-const AUTO_OFFLINE_MINUTES = 120; // 2小時無GPS才自動下線
+const AUTO_OFFLINE_MINUTES = 180; // 3小時無GPS才自動下線
 
 async function autoOfflineCheck() {
   try {
