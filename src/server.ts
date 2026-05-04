@@ -56,7 +56,7 @@ async function autoOfflineCheck() {
       FROM driver_sessions ds
       JOIN drivers d ON ds.driver_id = d.id
       JOIN buses b ON ds.bus_id = b.id
-      WHERE ds.session_date = CURDATE()
+      WHERE ds.session_date = DATE(CONVERT_TZ(NOW(), '+00:00', '+08:00'))
         AND ds.end_time IS NULL
         AND COALESCE(
           (SELECT MAX(bl.created_at) FROM bus_locations bl WHERE bl.session_id = ds.id),
@@ -120,7 +120,7 @@ app.get('/api/driver/me', auth(['driver']), async (req: AuthRequest, res) => {
     const driver = drivers[0];
     if (!driver) return res.status(404).json({ error: '找不到司機' });
     const [sessions]: any = await pool.query(
-      `SELECT * FROM driver_sessions WHERE driver_id = ? AND session_date = CURDATE() ORDER BY id DESC LIMIT 1`,
+      `SELECT * FROM driver_sessions WHERE driver_id = ? AND session_date = DATE(CONVERT_TZ(NOW(), '+00:00', '+08:00')) ORDER BY id DESC LIMIT 1`,
       [driverId]
     );
     res.json({ driver, session: sessions[0] || null });
@@ -136,12 +136,12 @@ app.post('/api/driver/online', auth(['driver']), async (req: AuthRequest, res) =
     const bus = buses[0];
     if (!bus) return res.status(400).json({ error: '尚未分配校車' });
     const [existing]: any = await pool.query(
-      `SELECT id FROM driver_sessions WHERE driver_id = ? AND session_date = CURDATE() AND end_time IS NULL LIMIT 1`,
+      `SELECT id FROM driver_sessions WHERE driver_id = ? AND session_date = DATE(CONVERT_TZ(NOW(), '+00:00', '+08:00')) AND end_time IS NULL LIMIT 1`,
       [driverId]
     );
     if (existing[0]) return res.status(400).json({ error: '已經上線' });
     const [result]: any = await pool.query(
-      `INSERT INTO driver_sessions (driver_id, bus_id, session_date) VALUES (?, ?, CURDATE())`,
+      `INSERT INTO driver_sessions (driver_id, bus_id, session_date) VALUES (?, ?, DATE(CONVERT_TZ(NOW(), '+00:00', '+08:00')))`,
       [driverId, bus.id]
     );
     res.json({ session_id: result.insertId, bus_id: bus.id });
@@ -154,7 +154,7 @@ app.post('/api/driver/offline', auth(['driver']), async (req: AuthRequest, res) 
   const driverId = req.user!.id;
   try {
     await pool.query(
-      `UPDATE driver_sessions SET end_time = NOW() WHERE driver_id = ? AND session_date = CURDATE() AND end_time IS NULL`,
+      `UPDATE driver_sessions SET end_time = NOW() WHERE driver_id = ? AND session_date = DATE(CONVERT_TZ(NOW(), '+00:00', '+08:00')) AND end_time IS NULL`,
       [driverId]
     );
     res.json({ ok: true });
@@ -169,7 +169,7 @@ app.post('/api/location/update', auth(['driver']), async (req: AuthRequest, res)
   try {
     const [sessions]: any = await pool.query(
       `SELECT ds.id, ds.bus_id FROM driver_sessions ds
-       WHERE ds.driver_id = ? AND ds.session_date = CURDATE() AND ds.end_time IS NULL LIMIT 1`,
+       WHERE ds.driver_id = ? AND ds.session_date = DATE(CONVERT_TZ(NOW(), '+00:00', '+08:00')) AND ds.end_time IS NULL LIMIT 1`,
       [driverId]
     );
     const session = sessions[0];
@@ -191,7 +191,7 @@ app.get('/api/driver/students', auth(['driver']), async (req: AuthRequest, res) 
     const bus = buses[0];
     if (!bus) return res.json({ students: [], session: null });
     const [sessions]: any = await pool.query(
-      `SELECT id FROM driver_sessions WHERE driver_id = ? AND session_date = CURDATE() AND end_time IS NULL LIMIT 1`,
+      `SELECT id FROM driver_sessions WHERE driver_id = ? AND session_date = DATE(CONVERT_TZ(NOW(), '+00:00', '+08:00')) AND end_time IS NULL LIMIT 1`,
       [driverId]
     );
     const session = sessions[0] || null;
@@ -248,7 +248,7 @@ app.post('/api/driver/scan', auth(['driver']), async (req: AuthRequest, res) => 
   try {
     const [sessions]: any = await pool.query(
       `SELECT ds.id, ds.bus_id FROM driver_sessions ds
-       WHERE ds.driver_id = ? AND ds.session_date = CURDATE() AND ds.end_time IS NULL LIMIT 1`,
+       WHERE ds.driver_id = ? AND ds.session_date = DATE(CONVERT_TZ(NOW(), '+00:00', '+08:00')) AND ds.end_time IS NULL LIMIT 1`,
       [driverId]
     );
     const session = sessions[0];
@@ -298,7 +298,7 @@ app.get('/api/parent/me', auth(['parent']), async (req: AuthRequest, res) => {
         [student.bus_id]
       );
       const [sessions]: any = await pool.query(
-        `SELECT id FROM driver_sessions WHERE bus_id = ? AND session_date = CURDATE() AND end_time IS NULL LIMIT 1`,
+        `SELECT id FROM driver_sessions WHERE bus_id = ? AND session_date = DATE(CONVERT_TZ(NOW(), '+00:00', '+08:00')) AND end_time IS NULL LIMIT 1`,
         [student.bus_id]
       );
       const sessionId = sessions[0]?.id || null;
@@ -357,7 +357,7 @@ app.get('/api/bus/:busId/location', auth(['parent', 'admin']), async (req: AuthR
       [busId]
     );
     const [sessions]: any = await pool.query(
-      `SELECT id FROM driver_sessions WHERE bus_id = ? AND session_date = CURDATE() AND end_time IS NULL LIMIT 1`,
+      `SELECT id FROM driver_sessions WHERE bus_id = ? AND session_date = DATE(CONVERT_TZ(NOW(), '+00:00', '+08:00')) AND end_time IS NULL LIMIT 1`,
       [busId]
     );
     res.json({ location: locs[0] || null, is_online: sessions.length > 0 });
@@ -382,7 +382,7 @@ app.get('/api/admin/buses', auth(['admin']), async (_req, res) => {
              bl.latitude, bl.longitude, bl.created_at as last_seen,
              (SELECT COUNT(*) FROM students s WHERE s.bus_id = b.id AND s.is_active = 1) as student_count,
              (SELECT id FROM driver_sessions ds
-              WHERE ds.bus_id = b.id AND ds.session_date = CURDATE() AND ds.end_time IS NULL LIMIT 1) as session_id
+              WHERE ds.bus_id = b.id AND ds.session_date = DATE(CONVERT_TZ(NOW(), '+00:00', '+08:00')) AND ds.end_time IS NULL LIMIT 1) as session_id
       FROM buses b
       LEFT JOIN drivers d ON b.driver_id = d.id
       LEFT JOIN bus_locations bl ON bl.id = (
@@ -433,11 +433,11 @@ app.get('/api/admin/buses/locations', auth(['admin']), async (_req, res) => {
              d.name AS driver_name, d.account AS driver_account,
              bl.latitude, bl.longitude, bl.created_at AS last_seen,
              (SELECT id FROM driver_sessions ds
-              WHERE ds.bus_id = b.id AND ds.session_date = CURDATE() AND ds.end_time IS NULL LIMIT 1) AS session_id,
+              WHERE ds.bus_id = b.id AND ds.session_date = DATE(CONVERT_TZ(NOW(), '+00:00', '+08:00')) AND ds.end_time IS NULL LIMIT 1) AS session_id,
              (SELECT COUNT(*) FROM students s WHERE s.bus_id = b.id AND s.is_active = 1) AS student_count,
              (SELECT COUNT(*) FROM boarding_records br
               JOIN driver_sessions ds ON br.session_id = ds.id
-              WHERE ds.bus_id = b.id AND ds.session_date = CURDATE() AND ds.end_time IS NULL) AS boarded_count
+              WHERE ds.bus_id = b.id AND ds.session_date = DATE(CONVERT_TZ(NOW(), '+00:00', '+08:00')) AND ds.end_time IS NULL) AS boarded_count
       FROM buses b
       LEFT JOIN drivers d ON b.driver_id = d.id
       LEFT JOIN bus_locations bl ON bl.id = (
@@ -457,7 +457,7 @@ app.get('/api/admin/buses/:busId/history', auth(['admin', 'parent']), async (req
   try {
     const [rows]: any = await pool.query(
       `SELECT latitude, longitude, created_at FROM bus_locations
-       WHERE bus_id = ? AND DATE(created_at) = CURDATE() ORDER BY created_at ASC`,
+       WHERE bus_id = ? AND DATE(created_at) = DATE(CONVERT_TZ(NOW(), '+00:00', '+08:00')) ORDER BY created_at ASC`,
       [busId]
     );
     res.json(rows);
@@ -1192,7 +1192,7 @@ app.get('/api/admin/history/student', auth(['admin']), async (req, res) => {
       FROM students s
       JOIN buses b ON s.bus_id = b.id
       JOIN driver_sessions ds ON ds.bus_id = b.id
-        AND ds.session_date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+        AND ds.session_date >= DATE_SUB(DATE(CONVERT_TZ(NOW(), '+00:00', '+08:00')), INTERVAL ? DAY)
       LEFT JOIN boarding_records br ON br.student_id = s.id AND br.session_id = ds.id
       WHERE s.name LIKE ? AND s.is_active = 1
       ORDER BY ds.session_date DESC, ds.start_time DESC
@@ -1215,7 +1215,7 @@ app.get('/api/admin/history/stats', auth(['admin']), async (req, res) => {
              (SELECT COUNT(*) FROM students s WHERE s.bus_id = b.id AND s.is_active = 1) as enrolled_students
       FROM buses b
       LEFT JOIN driver_sessions ds ON ds.bus_id = b.id
-        AND ds.session_date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+        AND ds.session_date >= DATE_SUB(DATE(CONVERT_TZ(NOW(), '+00:00', '+08:00')), INTERVAL ? DAY)
         AND ds.end_time IS NOT NULL
       LEFT JOIN (
         SELECT session_id, COUNT(*) as cnt FROM boarding_records GROUP BY session_id
@@ -1239,7 +1239,7 @@ app.post('/api/driver/scan-alight', auth(['driver']), async (req: AuthRequest, r
   try {
     const [sessions]: any = await pool.query(
       `SELECT ds.id, ds.bus_id FROM driver_sessions ds
-       WHERE ds.driver_id = ? AND ds.session_date = CURDATE() AND ds.end_time IS NULL LIMIT 1`,
+       WHERE ds.driver_id = ? AND ds.session_date = DATE(CONVERT_TZ(NOW(), '+00:00', '+08:00')) AND ds.end_time IS NULL LIMIT 1`,
       [driverId]
     );
     const session = sessions[0];
