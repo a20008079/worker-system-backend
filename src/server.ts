@@ -1,4 +1,4 @@
-// src/server.ts — 校車定位管理系統後端（含放學時段 + 座位管理）
+﻿// src/server.ts — 校車定位管理系統後端（含放學時段 + 座位管理）
 import express, { Request, Response, NextFunction } from 'express';
 import mysql from 'mysql2/promise';
 import cors from 'cors';
@@ -1578,11 +1578,11 @@ app.delete('/api/admin/bus-stops/:id', auth(['admin']), async (req, res) => {
 //   students 表的 dismissal_mon ~ dismissal_fri 是 enum('1620','1800','不搭')
 //   v4 約定:
 //     - NULL                = 該天不搭(顯示「不搭」)
---     - '1620' / '1800'     = 放學該天搭哪一班
---     - 上學 (morning) row  = 該天有搭時也存 '1620' 當「有搭」佔位值
---                            (上學表 SELECT 把它顯示成空字串,不顯示班次)
---   所以同一個學生通常會有兩個 students row,一筆 morning、一筆 afternoon,
---   兩筆的 dismissal_* 互相獨立。
+//     - '1620' / '1800'     = 放學該天搭哪一班
+//     - 上學 (morning) row  = 該天有搭時也存 '1620' 當「有搭」佔位值
+//                            (上學表 SELECT 把它顯示成空字串,不顯示班次)
+//   所以同一個學生通常會有兩個 students row,一筆 morning、一筆 afternoon,
+//   兩筆的 dismissal_* 互相獨立。
 //
 // 加的 endpoint:
 //   GET   /api/admin/bus/morning              取上學表 (預期 348 row)
