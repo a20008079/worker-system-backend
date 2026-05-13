@@ -1680,7 +1680,7 @@ app.get('/api/admin/bus/buses', auth(['admin']), async (_req: AuthRequest, res: 
   try {
     const [rows] = await pool.query(`
       SELECT id, bus_name, pickup_time, company, driver_phone, plate_number,
-             account_id, account_pass
+             account_id, account_pass, skip_1620, van_only
       FROM buses
       WHERE is_active = 1
       ORDER BY bus_name
@@ -1766,6 +1766,7 @@ app.put('/api/admin/bus/bus/:id', auth(['admin']), async (req: AuthRequest, res:
   const allowedFields = new Set([
     'pickup_time', 'company', 'driver_phone', 'plate_number',
     'account_id', 'account_pass',
+    'skip_1620', 'van_only',
   ]);
   const setClauses: string[] = [];
   const setValues: any[] = [];
@@ -1819,3 +1820,83 @@ app.get('/api/admin/bus/audit', auth(['admin']), async (req: AuthRequest, res: R
 // END of v4 階段 1 patch
 // ============================================================
 
+
+// ============================================================
+// 系統設定 (車隊參數) — 階段 3a
+// ============================================================
+
+const ALLOWED_CONFIG_KEYS = new Set([
+  'FLEET_BIG_BUS',
+  'FLEET_VAN',
+  'BIG_BUS_CAP_MORNING',
+  'BIG_BUS_CAP_AFTERNOON',
+  'VAN_CAP',
+  'BIG_BUS_THRESHOLD',
+]);
+
+// GET /api/admin/config — 取所有設定
+app.get('/api/admin/config', auth(['admin']), async (_req: AuthRequest, res: Response) => {
+  try {
+    const [rows] = await pool.query(`
+      SELECT config_key, config_value, description, updated_at, updated_by
+      FROM system_config
+      ORDER BY config_key
+    `);
+    res.json({ configs: rows });
+  } catch (err) {
+    console.error('GET /api/admin/config error:', err);
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// PUT /api/admin/config — 更新一筆或多筆設定
+// body: { configs: [{ key, value }, ...] }
+app.put('/api/admin/config', auth(['admin']), async (req: AuthRequest, res: Response) => {
+  const { configs } = req.body || {};
+  if (!Array.isArray(configs) || configs.length === 0) {
+    return res.status(400).json({ error: 'configs must be a non-empty array' });
+  }
+  // 驗證所有 key 都在白名單,且 value 是非負整數
+  for (const c of configs) {
+    if (!ALLOWED_CONFIG_KEYS.has(c.key)) {
+      return res.status(400).json({ error: `invalid config key: ${c.key}` });
+    }
+    const n = Number(c.value);
+    if (!Number.isFinite(n) || n < 0 || !Number.isInteger(n)) {
+      return res.status(400).json({
+        error: `invalid value for ${c.key}: must be a non-negative integer`,
+      });
+    }
+  }
+
+  const updatedBy = String(req.user?.id ?? 'admin');
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    for (const c of configs) {
+      await conn.query(
+        `INSERT INTO system_config (config_key, config_value, updated_by)
+         VALUES (?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           config_value = VALUES(config_value),
+           updated_by = VALUES(updated_by)`,
+        [c.key, String(c.value), updatedBy]
+      );
+    }
+    await conn.commit();
+
+    const [rows] = await conn.query(`
+      SELECT config_key, config_value, description, updated_at, updated_by
+      FROM system_config
+      ORDER BY config_key
+    `);
+    res.json({ configs: rows, updated: configs.length });
+  } catch (err) {
+    await conn.rollback();
+    console.error('PUT /api/admin/config error:', err);
+    res.status(500).json({ error: String(err) });
+  } finally {
+    conn.release();
+  }
+});
