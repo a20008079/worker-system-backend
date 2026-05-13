@@ -1559,3 +1559,263 @@ app.delete('/api/admin/bus-stops/:id', auth(['admin']), async (req, res) => {
     res.status(500).json({ error: String(e) });
   }
 });
+
+
+// ============================================================
+// v4 階段 1 — 校車系統後端 API (專屬版,對齊 a20008079 的 server.ts)
+// ============================================================
+// 使用方式:把這整段貼到 worker-system-backend/src/server.ts 的最尾巴
+// (跟你現有的 /api/admin/import-semester / /api/admin/bus-stops 那些一樣
+//  放在 app.listen 之後)
+//
+// 對齊的點:
+//   - 用 JWT auth(['admin']) 而不是 session
+//   - admin id 從 req.user!.id 取(AuthRequest 型別)
+//   - admins 表的姓名欄位是 `name`(不是 username)
+//   - 用 pool / pool.getConnection() (mysql2/promise)
+//
+// 重要約定(讀過再改 SQL!):
+//   students 表的 dismissal_mon ~ dismissal_fri 是 enum('1620','1800','不搭')
+//   v4 約定:
+//     - NULL                = 該天不搭(顯示「不搭」)
+--     - '1620' / '1800'     = 放學該天搭哪一班
+--     - 上學 (morning) row  = 該天有搭時也存 '1620' 當「有搭」佔位值
+--                            (上學表 SELECT 把它顯示成空字串,不顯示班次)
+--   所以同一個學生通常會有兩個 students row,一筆 morning、一筆 afternoon,
+--   兩筆的 dismissal_* 互相獨立。
+//
+// 加的 endpoint:
+//   GET   /api/admin/bus/morning              取上學表 (預期 348 row)
+//   GET   /api/admin/bus/afternoon            取放學表 (預期 705 row)
+//   GET   /api/admin/bus/buses                取所有路線(編輯下拉用)
+//   PUT   /api/admin/bus/student/:id          更新單一學生 + 寫 audit log
+//   PUT   /api/admin/bus/bus/:id              更新路線屬性
+//   GET   /api/admin/bus/audit                取修改紀錄
+// ============================================================
+
+
+// ============================================================
+// 1. GET /api/admin/bus/morning
+// ============================================================
+app.get('/api/admin/bus/morning', auth(['admin']), async (_req: AuthRequest, res: Response) => {
+  try {
+    const [rows] = await pool.query(`
+      SELECT
+        ROW_NUMBER() OVER (PARTITION BY s.bus_id ORDER BY s.id) AS '序號',
+        s.school_class                                          AS '年級',
+        s.name                                                  AS '姓名',
+        s.parent_phone                                          AS '電話',
+        s.pickup_location                                       AS '接送位置',
+        b.pickup_time                                           AS '上車時間',
+        CASE WHEN s.dismissal_mon IS NULL THEN '不搭' ELSE '' END AS '星期一',
+        CASE WHEN s.dismissal_tue IS NULL THEN '不搭' ELSE '' END AS '星期二',
+        CASE WHEN s.dismissal_wed IS NULL THEN '不搭' ELSE '' END AS '星期三',
+        CASE WHEN s.dismissal_thu IS NULL THEN '不搭' ELSE '' END AS '星期四',
+        CASE WHEN s.dismissal_fri IS NULL THEN '不搭' ELSE '' END AS '星期五',
+        b.bus_name                                              AS '路線',
+        b.company                                               AS '交通公司',
+        b.driver_phone                                          AS '司機/電話',
+        b.plate_number                                          AS '車號',
+        b.account_id                                            AS '帳號',
+        b.account_pass                                          AS '密碼',
+        s.id                                                    AS '_student_id',
+        s.bus_id                                                AS '_bus_id'
+      FROM students s
+      LEFT JOIN buses b ON s.bus_id = b.id
+      WHERE s.school_direction = 'morning' AND s.is_active = 1
+      ORDER BY s.bus_id, s.id
+    `);
+    res.json({ rows });
+  } catch (err) {
+    console.error('GET /api/admin/bus/morning error:', err);
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+
+// ============================================================
+// 2. GET /api/admin/bus/afternoon
+// ============================================================
+app.get('/api/admin/bus/afternoon', auth(['admin']), async (_req: AuthRequest, res: Response) => {
+  try {
+    const [rows] = await pool.query(`
+      SELECT
+        ROW_NUMBER() OVER (PARTITION BY s.bus_id ORDER BY s.id) AS '序號',
+        s.school_class                                          AS '年級',
+        s.name                                                  AS '姓名',
+        s.parent_phone                                          AS '電話',
+        s.pickup_location                                       AS '接送位置',
+        s.dropoff_1620                                          AS '1620到站時間',
+        s.dropoff_1800                                          AS '1800到站時間',
+        CASE WHEN s.dismissal_mon IS NULL THEN '不搭' ELSE s.dismissal_mon END AS '星期一',
+        CASE WHEN s.dismissal_tue IS NULL THEN '不搭' ELSE s.dismissal_tue END AS '星期二',
+        CASE WHEN s.dismissal_wed IS NULL THEN '不搭' ELSE s.dismissal_wed END AS '星期三',
+        CASE WHEN s.dismissal_thu IS NULL THEN '不搭' ELSE s.dismissal_thu END AS '星期四',
+        CASE WHEN s.dismissal_fri IS NULL THEN '不搭' ELSE s.dismissal_fri END AS '星期五',
+        b.bus_name                                              AS '路線',
+        b.company                                               AS '交通公司',
+        b.driver_phone                                          AS '司機/電話',
+        b.plate_number                                          AS '車號',
+        b.account_id                                            AS '帳號',
+        b.account_pass                                          AS '密碼',
+        s.id                                                    AS '_student_id',
+        s.bus_id                                                AS '_bus_id'
+      FROM students s
+      LEFT JOIN buses b ON s.bus_id = b.id
+      WHERE s.school_direction = 'afternoon' AND s.is_active = 1
+      ORDER BY s.bus_id, s.id
+    `);
+    res.json({ rows });
+  } catch (err) {
+    console.error('GET /api/admin/bus/afternoon error:', err);
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+
+// ============================================================
+// 3. GET /api/admin/bus/buses — 給「改路線」下拉用
+// ============================================================
+app.get('/api/admin/bus/buses', auth(['admin']), async (_req: AuthRequest, res: Response) => {
+  try {
+    const [rows] = await pool.query(`
+      SELECT id, bus_name, pickup_time, company, driver_phone, plate_number,
+             account_id, account_pass
+      FROM buses
+      WHERE is_active = 1
+      ORDER BY bus_name
+    `);
+    res.json({ rows });
+  } catch (err) {
+    console.error('GET /api/admin/bus/buses error:', err);
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+
+// ============================================================
+// 4. PUT /api/admin/bus/student/:id — 更新單一學生 + 寫 audit log
+// ============================================================
+app.put('/api/admin/bus/student/:id', auth(['admin']), async (req: AuthRequest, res: Response) => {
+  const studentId = parseInt(req.params.id, 10);
+  if (isNaN(studentId)) {
+    return res.status(400).json({ error: 'invalid student id' });
+  }
+  const adminId = req.user!.id;
+
+  const payload = req.body || {};
+
+  // 允許更新的欄位白名單(防前端塞奇怪欄位)
+  const allowedFields = new Set([
+    'parent_phone', 'pickup_location', 'bus_id',
+    'dropoff_1620', 'dropoff_1800',
+    'dismissal_mon', 'dismissal_tue', 'dismissal_wed',
+    'dismissal_thu', 'dismissal_fri',
+  ]);
+
+  const setClauses: string[] = [];
+  const setValues: any[] = [];
+  for (const [k, v] of Object.entries(payload)) {
+    if (!allowedFields.has(k)) continue;
+    setClauses.push(`\`${k}\` = ?`);
+    setValues.push(v);  // null 會正確寫進 DB 變 NULL
+  }
+
+  if (setClauses.length === 0) {
+    return res.status(400).json({ error: 'nothing to update' });
+  }
+
+  // 開 transaction:同時 UPDATE 學生 + INSERT audit log
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    setValues.push(studentId);
+    const sql = `UPDATE students SET ${setClauses.join(', ')} WHERE id = ?`;
+    const [result]: any = await conn.query(sql, setValues);
+
+    if (result.affectedRows === 0) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'student not found' });
+    }
+
+    await conn.query(
+      'INSERT INTO bus_audit_logs (student_id, admin_id, action) VALUES (?, ?, ?)',
+      [studentId, adminId, 'update']
+    );
+
+    await conn.commit();
+    res.json({ ok: true, student_id: studentId });
+  } catch (err) {
+    await conn.rollback();
+    console.error('PUT /api/admin/bus/student error:', err);
+    res.status(500).json({ error: String(err) });
+  } finally {
+    conn.release();
+  }
+});
+
+
+// ============================================================
+// 5. PUT /api/admin/bus/bus/:id — 更新路線屬性
+// ============================================================
+app.put('/api/admin/bus/bus/:id', auth(['admin']), async (req: AuthRequest, res: Response) => {
+  const busId = parseInt(req.params.id, 10);
+  if (isNaN(busId)) return res.status(400).json({ error: 'invalid bus id' });
+
+  const allowedFields = new Set([
+    'pickup_time', 'company', 'driver_phone', 'plate_number',
+    'account_id', 'account_pass',
+  ]);
+  const setClauses: string[] = [];
+  const setValues: any[] = [];
+  for (const [k, v] of Object.entries(req.body || {})) {
+    if (!allowedFields.has(k)) continue;
+    setClauses.push(`\`${k}\` = ?`);
+    setValues.push(v);
+  }
+  if (setClauses.length === 0) return res.status(400).json({ error: 'nothing to update' });
+
+  setValues.push(busId);
+  try {
+    const [result]: any = await pool.query(
+      `UPDATE buses SET ${setClauses.join(', ')} WHERE id = ?`,
+      setValues
+    );
+    if (result.affectedRows === 0) return res.status(404).json({ error: 'bus not found' });
+    res.json({ ok: true, bus_id: busId });
+  } catch (err) {
+    console.error('PUT /api/admin/bus/bus error:', err);
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+
+// ============================================================
+// 6. GET /api/admin/bus/audit — 取修改紀錄(最近 N 筆)
+// ============================================================
+app.get('/api/admin/bus/audit', auth(['admin']), async (req: AuthRequest, res: Response) => {
+  const limit = Math.min(parseInt(req.query.limit as string, 10) || 100, 500);
+  try {
+    const [rows] = await pool.query(`
+      SELECT
+        l.id, l.action, l.changed_at,
+        l.student_id, s.name AS student_name, s.school_class,
+        l.admin_id, a.name AS admin_name
+      FROM bus_audit_logs l
+      LEFT JOIN students s ON s.id = l.student_id
+      LEFT JOIN admins   a ON a.id = l.admin_id
+      ORDER BY l.changed_at DESC
+      LIMIT ?
+    `, [limit]);
+    res.json({ rows });
+  } catch (err) {
+    console.error('GET /api/admin/bus/audit error:', err);
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ============================================================
+// END of v4 階段 1 patch
+// ============================================================
+
