@@ -1520,47 +1520,6 @@ app.post('/api/admin/import-semester', auth(['admin']), async (req: AuthRequest,
   }
 });
 
-// ══════════════════════════════════════════════════════
-// 停車點管理 API（為之後路線對應準備）
-// ══════════════════════════════════════════════════════
-app.get('/api/admin/bus-stops', auth(['admin']), async (_req, res) => {
-  try {
-    const [rows]: any = await pool.query(
-      `SELECT bs.id, bs.stop_name, bs.bus_id, b.bus_name, b.route_name
-       FROM bus_stops bs JOIN buses b ON bs.bus_id = b.id
-       ORDER BY b.route_name, b.bus_name, bs.stop_name`
-    );
-    res.json(rows);
-  } catch {
-    res.json([]); // 表不存在時回傳空陣列
-  }
-});
-
-app.post('/api/admin/bus-stops', auth(['admin']), async (req, res) => {
-  const { stop_name, bus_id } = req.body;
-  if (!stop_name || !bus_id) return res.status(400).json({ error: '缺少資料' });
-  try {
-    const [r]: any = await pool.query(
-      `INSERT INTO bus_stops (stop_name, bus_id) VALUES (?, ?)
-       ON DUPLICATE KEY UPDATE bus_id=?`,
-      [stop_name.trim(), bus_id, bus_id]
-    );
-    res.json({ ok: true, id: r.insertId });
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
-  }
-});
-
-app.delete('/api/admin/bus-stops/:id', auth(['admin']), async (req, res) => {
-  try {
-    await pool.query(`DELETE FROM bus_stops WHERE id=?`, [req.params.id]);
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
-  }
-});
-
-
 // ============================================================
 // v4 階段 1 — 校車系統後端 API (專屬版,對齊 a20008079 的 server.ts)
 // ============================================================
@@ -1900,3 +1859,263 @@ app.put('/api/admin/config', auth(['admin']), async (req: AuthRequest, res: Resp
     conn.release();
   }
 });
+
+// ============================================================
+// 階段 3b Step 1 — 站牌管理 API (給地圖功能用)
+// ============================================================
+// 新 bus_stops 表 schema:
+//   id, bus_id, stop_name, stop_order, latitude, longitude, address, pickup_time
+// 跟舊版完全不同 (舊版只有 id/stop_name/bus_id),migration 009 已重建
+
+interface BusStopRow {
+  id: number;
+  bus_id: number;
+  stop_name: string;
+  stop_order: number | null;
+  latitude: number | null;
+  longitude: number | null;
+  address: string | null;
+  pickup_time: string | null;
+}
+
+// 工具:從學生 pickup_location 抓某路線的獨特站牌 (給「一鍵匯入」用)
+async function suggestStopsFromStudents(busId: number): Promise<string[]> {
+  const [rows]: any = await pool.query(
+    `SELECT DISTINCT TRIM(pickup_location) AS loc
+     FROM students
+     WHERE bus_id = ? AND is_active = 1 AND pickup_location IS NOT NULL AND pickup_location != ''
+     ORDER BY loc`,
+    [busId]
+  );
+  return rows.map((r: any) => r.loc).filter((s: string) => s && s.length > 0);
+}
+
+// ============================================================
+// GET /api/admin/buses/:bus_id/stops — 列某路線的所有站牌
+// ============================================================
+app.get('/api/admin/buses/:bus_id/stops', auth(['admin']), async (req: AuthRequest, res: Response) => {
+  const busId = Number(req.params.bus_id);
+  if (!Number.isInteger(busId) || busId <= 0) {
+    return res.status(400).json({ error: 'invalid bus_id' });
+  }
+  try {
+    const [rows]: any = await pool.query(
+      `SELECT id, bus_id, stop_name, stop_order, latitude, longitude, address, pickup_time
+       FROM bus_stops
+       WHERE bus_id = ?
+       ORDER BY stop_order IS NULL, stop_order, id`,
+      [busId]
+    );
+    res.json({ stops: rows });
+  } catch (err) {
+    console.error('GET stops error:', err);
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ============================================================
+// POST /api/admin/buses/:bus_id/stops — 新增單一站牌
+// body: { stop_name, latitude?, longitude?, address?, pickup_time?, stop_order? }
+// ============================================================
+app.post('/api/admin/buses/:bus_id/stops', auth(['admin']), async (req: AuthRequest, res: Response) => {
+  const busId = Number(req.params.bus_id);
+  const { stop_name, latitude, longitude, address, pickup_time, stop_order } = req.body || {};
+  if (!Number.isInteger(busId) || busId <= 0) {
+    return res.status(400).json({ error: 'invalid bus_id' });
+  }
+  if (!stop_name || typeof stop_name !== 'string' || stop_name.trim() === '') {
+    return res.status(400).json({ error: 'stop_name is required' });
+  }
+  try {
+    // 取現有最大 stop_order + 1 當預設
+    const [maxRows]: any = await pool.query(
+      'SELECT COALESCE(MAX(stop_order), 0) AS max_order FROM bus_stops WHERE bus_id = ?',
+      [busId]
+    );
+    const defaultOrder = (maxRows[0]?.max_order || 0) + 1;
+
+    const [r]: any = await pool.query(
+      `INSERT INTO bus_stops (bus_id, stop_name, stop_order, latitude, longitude, address, pickup_time)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        busId,
+        stop_name.trim(),
+        stop_order ?? defaultOrder,
+        latitude ?? null,
+        longitude ?? null,
+        address ?? null,
+        pickup_time ?? null,
+      ]
+    );
+    res.json({ ok: true, id: r.insertId });
+  } catch (err) {
+    console.error('POST stop error:', err);
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ============================================================
+// POST /api/admin/buses/:bus_id/stops/import-from-students
+// 從該路線學生的 pickup_location 抓獨特站牌,批次加入 (座標留空)
+// body: {} (不需要參數)
+// ============================================================
+app.post('/api/admin/buses/:bus_id/stops/import-from-students', auth(['admin']), async (req: AuthRequest, res: Response) => {
+  const busId = Number(req.params.bus_id);
+  if (!Number.isInteger(busId) || busId <= 0) {
+    return res.status(400).json({ error: 'invalid bus_id' });
+  }
+  try {
+    const suggested = await suggestStopsFromStudents(busId);
+    if (suggested.length === 0) {
+      return res.json({ imported: 0, skipped: 0, message: '該路線沒有學生 pickup_location 資料' });
+    }
+
+    // 取目前已有的站牌名 (避免重複)
+    const [existRows]: any = await pool.query(
+      'SELECT stop_name FROM bus_stops WHERE bus_id = ?',
+      [busId]
+    );
+    const existing = new Set(existRows.map((r: any) => r.stop_name.trim()));
+
+    const toInsert = suggested.filter((s) => !existing.has(s));
+    if (toInsert.length === 0) {
+      return res.json({ imported: 0, skipped: suggested.length, message: '所有站牌都已存在' });
+    }
+
+    // 取目前最大 order
+    const [maxRows]: any = await pool.query(
+      'SELECT COALESCE(MAX(stop_order), 0) AS max_order FROM bus_stops WHERE bus_id = ?',
+      [busId]
+    );
+    let order = (maxRows[0]?.max_order || 0) + 1;
+
+    // 批次 insert
+    for (const name of toInsert) {
+      await pool.query(
+        `INSERT INTO bus_stops (bus_id, stop_name, stop_order) VALUES (?, ?, ?)`,
+        [busId, name, order]
+      );
+      order += 1;
+    }
+
+    res.json({
+      imported: toInsert.length,
+      skipped:  suggested.length - toInsert.length,
+      message:  `從學生資料匯入 ${toInsert.length} 個站牌${suggested.length - toInsert.length > 0 ? ` (跳過 ${suggested.length - toInsert.length} 個已存在)` : ''}`,
+    });
+  } catch (err) {
+    console.error('import-from-students error:', err);
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ============================================================
+// PUT /api/admin/stops/:id — 更新站牌
+// body: 任意 subset of { stop_name, stop_order, latitude, longitude, address, pickup_time }
+// ============================================================
+app.put('/api/admin/stops/:id', auth(['admin']), async (req: AuthRequest, res: Response) => {
+  const stopId = Number(req.params.id);
+  if (!Number.isInteger(stopId) || stopId <= 0) {
+    return res.status(400).json({ error: 'invalid stop id' });
+  }
+  const allowedFields = new Set([
+    'stop_name', 'stop_order', 'latitude', 'longitude', 'address', 'pickup_time',
+  ]);
+  const updates: string[] = [];
+  const values: any[] = [];
+  for (const [k, v] of Object.entries(req.body || {})) {
+    if (!allowedFields.has(k)) continue;
+    updates.push(`${k} = ?`);
+    values.push(v === '' ? null : v);
+  }
+  if (updates.length === 0) {
+    return res.status(400).json({ error: 'no valid fields to update' });
+  }
+  values.push(stopId);
+  try {
+    const [r]: any = await pool.query(
+      `UPDATE bus_stops SET ${updates.join(', ')} WHERE id = ?`,
+      values
+    );
+    if (r.affectedRows === 0) {
+      return res.status(404).json({ error: 'stop not found' });
+    }
+    const [rows]: any = await pool.query(
+      'SELECT id, bus_id, stop_name, stop_order, latitude, longitude, address, pickup_time FROM bus_stops WHERE id = ?',
+      [stopId]
+    );
+    res.json({ stop: rows[0] });
+  } catch (err) {
+    console.error('PUT stop error:', err);
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ============================================================
+// DELETE /api/admin/stops/:id — 刪站牌
+// ============================================================
+app.delete('/api/admin/stops/:id', auth(['admin']), async (req: AuthRequest, res: Response) => {
+  const stopId = Number(req.params.id);
+  if (!Number.isInteger(stopId) || stopId <= 0) {
+    return res.status(400).json({ error: 'invalid stop id' });
+  }
+  try {
+    const [r]: any = await pool.query('DELETE FROM bus_stops WHERE id = ?', [stopId]);
+    if (r.affectedRows === 0) {
+      return res.status(404).json({ error: 'stop not found' });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('DELETE stop error:', err);
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ============================================================
+// PUT /api/admin/buses/:bus_id/stops/reorder — 批次重排順序
+// body: { order: [id1, id2, id3, ...] }
+// 把這些 id 依照陣列順序設成 stop_order = 1, 2, 3...
+// ============================================================
+app.put('/api/admin/buses/:bus_id/stops/reorder', auth(['admin']), async (req: AuthRequest, res: Response) => {
+  const busId = Number(req.params.bus_id);
+  const { order } = req.body || {};
+  if (!Number.isInteger(busId) || busId <= 0) {
+    return res.status(400).json({ error: 'invalid bus_id' });
+  }
+  if (!Array.isArray(order) || order.length === 0) {
+    return res.status(400).json({ error: 'order must be a non-empty array of stop ids' });
+  }
+  for (const id of order) {
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ error: `invalid stop id in order: ${id}` });
+    }
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    // 確認這些 id 都屬於這條 bus
+    const placeholders = order.map(() => '?').join(',');
+    const [rows]: any = await conn.query(
+      `SELECT id FROM bus_stops WHERE id IN (${placeholders}) AND bus_id = ?`,
+      [...order, busId]
+    );
+    if (rows.length !== order.length) {
+      await conn.rollback();
+      return res.status(400).json({ error: 'some stop ids do not belong to this bus' });
+    }
+    // 更新 order
+    for (let i = 0; i < order.length; i++) {
+      await conn.query('UPDATE bus_stops SET stop_order = ? WHERE id = ?', [i + 1, order[i]]);
+    }
+    await conn.commit();
+    res.json({ ok: true, reordered: order.length });
+  } catch (err) {
+    await conn.rollback();
+    console.error('reorder error:', err);
+    res.status(500).json({ error: String(err) });
+  } finally {
+    conn.release();
+  }
+});
+
