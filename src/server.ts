@@ -2119,3 +2119,47 @@ app.put('/api/admin/buses/:bus_id/stops/reorder', auth(['admin']), async (req: A
   }
 });
 
+
+// ============================================================
+// 階段 3b Step 2 — 家長端站牌 API
+// ============================================================
+// GET /api/parent/buses/:bus_id/stops
+// 家長可以看自己孩子那條車的站牌(限 admin/parent 都可呼叫,parent 要驗證權限)
+
+app.get('/api/parent/buses/:bus_id/stops', auth(['admin', 'parent']), async (req: AuthRequest, res: Response) => {
+  const busId = Number(req.params.bus_id);
+  if (!Number.isInteger(busId) || busId <= 0) {
+    return res.status(400).json({ error: 'invalid bus_id' });
+  }
+
+  // 若是 parent,驗證該 bus 是該 parent 的孩子的車
+  if (req.user?.role === 'parent') {
+    try {
+      const [check]: any = await pool.query(
+        `SELECT s.id FROM students s WHERE s.parent_id = ? AND s.bus_id = ? AND s.is_active = 1 LIMIT 1`,
+        [req.user.id, busId]
+      );
+      if (!check[0]) {
+        return res.status(403).json({ error: '無權限查看此校車站牌' });
+      }
+    } catch (err) {
+      console.error('parent stops auth check error:', err);
+      return res.status(500).json({ error: String(err) });
+    }
+  }
+
+  // 取站牌 (只回有座標的)
+  try {
+    const [rows]: any = await pool.query(
+      `SELECT id, bus_id, stop_name, stop_order, latitude, longitude, address, pickup_time
+       FROM bus_stops
+       WHERE bus_id = ? AND latitude IS NOT NULL AND longitude IS NOT NULL
+       ORDER BY stop_order IS NULL, stop_order, id`,
+      [busId]
+    );
+    res.json({ stops: rows });
+  } catch (err) {
+    console.error('GET parent stops error:', err);
+    res.status(500).json({ error: String(err) });
+  }
+});
