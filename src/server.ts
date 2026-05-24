@@ -10,7 +10,7 @@ const PORT = Number(process.env.PORT || 8080);
 const JWT_SECRET = process.env.JWT_SECRET || 'school-bus-secret-2026';
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' })); // 3c-1: 批次匯入 479 筆 JSON 較大,預設 100KB 會 413
 
 // ── DB Pool ────────────────────────────────────────────
 const pool = mysql.createPool({
