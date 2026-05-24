@@ -2163,3 +2163,185 @@ app.get('/api/parent/buses/:bus_id/stops', auth(['admin', 'parent']), async (req
     res.status(500).json({ error: String(err) });
   }
 });
+
+// ============================================================
+// 階段 3c Step 3c-1 : Google 表單匯入 (staging)
+// 加在檔案尾巴 (跟 v4 / 3a / 3b patch 一樣的位置)
+// 解析在前端做 (SheetJS),這裡只收 JSON rows 寫進 staging
+// ============================================================
+
+// 產生 batch_id: 20260524_143022 (台北時間)
+function makeBatchId(): string {
+  const d = new Date(Date.now() + 8 * 3600 * 1000); // UTC -> +08:00
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}_` +
+         `${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}`;
+}
+
+// 上傳: 前端解析好的 rows (479 筆) 寫進 staging 表
+app.post('/api/admin/student-import/upload', auth(['admin']), async (req: AuthRequest, res: Response) => {
+  const { rows } = req.body;
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return res.status(400).json({ error: '沒有資料' });
+  }
+
+  const batchId = makeBatchId();
+
+  // ── 先掃一遍算 班+座 重複 (dup_seat 旗標需要全批比對) ──
+  const seatCount: Record<string, number> = {};
+  for (const r of rows) {
+    const key = `${(r.class_name || '').trim()}#${(r.seat_no || '').trim()}`;
+    if ((r.class_name || '').trim() && (r.seat_no || '').trim()) {
+      seatCount[key] = (seatCount[key] || 0) + 1;
+    }
+  }
+
+  // ── 逐筆算品質旗標 ──
+  // 真實資料確認 (479 筆): 放學值只有 1800/1620/不搭;上學站常空白(只搭放學的人)
+  // 「無」代表家長明確表示不搭該段,視同已填,不算 empty_stop
+  function qualityFlags(r: any): string {
+    const flags: string[] = [];
+    const addr = (r.home_address || '').trim();
+    if (addr.length > 0 && addr.length < 10) flags.push('short_addr');     // 地址過短 (14筆)
+    if ((r.parent_phone || '').includes('/')) flags.push('phone_slash');    // 電話含 / (2筆)
+
+    const isBlank = (v: any) => {
+      const s = (v ?? '').toString().trim();
+      return s === '';   // 注意:'無' 不算 blank
+    };
+    const period = r.ride_period || '';
+    const needPickup = period.includes('上學');
+    const needDropoff = period.includes('放學');
+    if ((needPickup && isBlank(r.pickup_stop)) ||
+        (needDropoff && isBlank(r.dropoff_stop))) {
+      flags.push('empty_stop');                                            // 正確算出 2 筆
+    }
+
+    const key = `${(r.class_name || '').trim()}#${(r.seat_no || '').trim()}`;
+    if (seatCount[key] > 1) flags.push('dup_seat');                         // 班+座重複 (13組)
+    return flags.join(',');
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    let inserted = 0;
+    const flagSummary: Record<string, number> = {
+      short_addr: 0, phone_slash: 0, empty_stop: 0, dup_seat: 0,
+    };
+
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i];
+      const flags = qualityFlags(r);
+      flags.split(',').filter(Boolean).forEach((f) => {
+        if (flagSummary[f] !== undefined) flagSummary[f]++;
+      });
+
+      await conn.query(
+        `INSERT INTO student_import_staging
+          (batch_id, row_num, timestamp_raw, class_name, seat_no, student_name,
+           parent_name, parent_phone, home_address, ride_period, pickup_stop,
+           dropoff_stop, mon_time, tue_time, wed_time, thu_time, fri_time, note,
+           quality_flags)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          batchId,
+          r.row_num || (i + 2),
+          r.timestamp_raw || null,
+          (r.class_name || '').trim() || null,
+          (r.seat_no || '').toString().trim() || null,
+          (r.student_name || '').trim() || null,
+          (r.parent_name || '').trim() || null,
+          (r.parent_phone || '').toString().trim() || null,
+          (r.home_address || '').trim() || null,
+          (r.ride_period || '').trim() || null,
+          (r.pickup_stop || '').trim() || null,
+          (r.dropoff_stop || '').trim() || null,
+          (r.mon_time || '').toString().trim() || null,
+          (r.tue_time || '').toString().trim() || null,
+          (r.wed_time || '').toString().trim() || null,
+          (r.thu_time || '').toString().trim() || null,
+          (r.fri_time || '').toString().trim() || null,
+          (r.note || '').trim() || null,
+          flags || null,
+        ]
+      );
+      inserted++;
+    }
+
+    await conn.commit();
+    res.json({
+      ok: true,
+      batch_id: batchId,
+      total: inserted,
+      quality: flagSummary,
+    });
+  } catch (e) {
+    await conn.rollback();
+    res.status(500).json({ error: String(e) });
+  } finally {
+    conn.release();
+  }
+});
+
+// 列出所有批次
+app.get('/api/admin/student-import/batches', auth(['admin']), async (_req: AuthRequest, res: Response) => {
+  try {
+    const [rows]: any = await pool.query(
+      `SELECT batch_id,
+              COUNT(*) AS total,
+              SUM(applied) AS applied_count,
+              MIN(created_at) AS created_at
+       FROM student_import_staging
+       GROUP BY batch_id
+       ORDER BY created_at DESC`
+    );
+    res.json({ batches: rows });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// 讀某批次明細 (預覽用)
+app.get('/api/admin/student-import/:batch_id', auth(['admin']), async (req: AuthRequest, res: Response) => {
+  const { batch_id } = req.params;
+  try {
+    const [rows]: any = await pool.query(
+      `SELECT id, row_num, timestamp_raw, class_name, seat_no, student_name,
+              parent_name, parent_phone, home_address, ride_period, pickup_stop,
+              dropoff_stop, mon_time, tue_time, wed_time, thu_time, fri_time, note,
+              quality_flags, match_status, matched_student_id,
+              geo_lat, geo_lng, recommended_bus_id, recommended_stop_id, applied
+       FROM student_import_staging
+       WHERE batch_id = ?
+       ORDER BY row_num`,
+      [batch_id]
+    );
+
+    const quality = { short_addr: 0, phone_slash: 0, empty_stop: 0, dup_seat: 0 };
+    for (const r of rows) {
+      (r.quality_flags || '').split(',').filter(Boolean).forEach((f: string) => {
+        if ((quality as any)[f] !== undefined) (quality as any)[f]++;
+      });
+    }
+
+    res.json({ batch_id, total: rows.length, quality, rows });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// 刪某批次 (上傳到一半失敗想重來時用;不是清空整張表)
+app.delete('/api/admin/student-import/:batch_id', auth(['admin']), async (req: AuthRequest, res: Response) => {
+  const { batch_id } = req.params;
+  try {
+    const [r]: any = await pool.query(
+      `DELETE FROM student_import_staging WHERE batch_id = ?`,
+      [batch_id]
+    );
+    res.json({ ok: true, deleted: r.affectedRows });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
