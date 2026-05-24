@@ -380,7 +380,7 @@ app.get('/api/admin/buses', auth(['admin']), async (_req, res) => {
       SELECT b.id, b.bus_name, b.route_name, b.is_active, b.bus_type, b.capacity,
              d.id as driver_id, d.name as driver_name,
              bl.latitude, bl.longitude, bl.created_at as last_seen,
-             (SELECT COUNT(*) FROM students s WHERE s.bus_id = b.id AND s.is_active = 1) as student_count,
+             (SELECT COUNT(*) FROM students s WHERE s.bus_id = b.id AND s.is_active = 1 AND s.school_direction = 'morning') as student_count,
              (SELECT id FROM driver_sessions ds
               WHERE ds.bus_id = b.id AND ds.session_date = DATE(CONVERT_TZ(NOW(), '+00:00', '+08:00')) AND ds.end_time IS NULL LIMIT 1) as session_id
       FROM buses b
@@ -434,7 +434,7 @@ app.get('/api/admin/buses/locations', auth(['admin']), async (_req, res) => {
              bl.latitude, bl.longitude, bl.created_at AS last_seen,
              (SELECT id FROM driver_sessions ds
               WHERE ds.bus_id = b.id AND ds.session_date = DATE(CONVERT_TZ(NOW(), '+00:00', '+08:00')) AND ds.end_time IS NULL LIMIT 1) AS session_id,
-             (SELECT COUNT(*) FROM students s WHERE s.bus_id = b.id AND s.is_active = 1) AS student_count,
+             (SELECT COUNT(*) FROM students s WHERE s.bus_id = b.id AND s.is_active = 1 AND s.school_direction = 'morning') AS student_count,
              (SELECT COUNT(*) FROM boarding_records br
               JOIN driver_sessions ds ON br.session_id = ds.id
               WHERE ds.bus_id = b.id AND ds.session_date = DATE(CONVERT_TZ(NOW(), '+00:00', '+08:00')) AND ds.end_time IS NULL) AS boarded_count
@@ -470,7 +470,7 @@ app.get('/api/admin/buses-simple', auth(['admin']), async (_req, res) => {
   try {
     const [rows]: any = await pool.query(
       `SELECT id, bus_name, route_name, bus_type, capacity,
-              (SELECT COUNT(*) FROM students s WHERE s.bus_id = buses.id AND s.is_active = 1) as student_count
+              (SELECT COUNT(*) FROM students s WHERE s.bus_id = buses.id AND s.is_active = 1 AND s.school_direction = 'morning') as student_count
        FROM buses WHERE is_active = 1 ORDER BY route_name, bus_name`
     );
     res.json(rows);
@@ -492,7 +492,7 @@ app.get('/api/admin/students', auth(['admin']), async (_req, res) => {
              s.dismissal_mon, s.dismissal_tue, s.dismissal_wed, s.dismissal_thu, s.dismissal_fri,
              p.name as parent_name, p.account as parent_account,
              b.bus_name, b.route_name, b.bus_type, b.capacity,
-             (SELECT COUNT(*) FROM students ss WHERE ss.bus_id = s.bus_id AND ss.is_active = 1) as bus_student_count
+             (SELECT COUNT(*) FROM students ss WHERE ss.bus_id = s.bus_id AND ss.is_active = 1 AND ss.school_direction = 'morning') as bus_student_count
       FROM students s
       JOIN parents p ON s.parent_id = p.id
       JOIN buses b ON s.bus_id = b.id
@@ -1329,7 +1329,7 @@ app.post('/api/admin/import-semester', auth(['admin']), async (req: AuthRequest,
     // 取得所有校車（含站牌對應）
     const [buses]: any = await conn.query(
       `SELECT id, bus_name, route_name, bus_type, capacity,
-              (SELECT COUNT(*) FROM students WHERE bus_id=buses.id AND is_active=1) as student_count
+              (SELECT COUNT(*) FROM students WHERE bus_id=buses.id AND is_active=1 AND school_direction='morning') as student_count
        FROM buses WHERE is_active=1`
     );
 
