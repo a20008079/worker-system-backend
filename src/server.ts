@@ -2345,3 +2345,138 @@ app.delete('/api/admin/student-import/:batch_id', auth(['admin']), async (req: A
     res.status(500).json({ error: String(e) });
   }
 });
+
+
+// ============================================================
+// 階段 3c Step 3c-2 : Geocoding (Nominatim 批次查經緯度)
+// ============================================================
+// 設計:可中斷續傳。前端反覆呼叫 geocode-step,每次查一小批 (10筆)。
+// 規範:Nominatim 限速 1 req/s,必須帶自訂 User-Agent。
+//   - 每筆間隔 1.1 秒
+//   - 只查 geo_lat IS NULL 的 (跳過已查的 -> 可續傳)
+//   - 地址過短 (<10字) 直接標 failed,不浪費 API 額度
+//   - 桃園地區:地址沒含「市/縣」時自動補「桃園市」提高命中率
+
+const NOMINATIM_UA = 'worker-system-school-bus/1.0 (contact: admin@school-bus)';
+
+function sleep(ms: number) { return new Promise((r) => setTimeout(r, ms)); }
+
+// 單筆地址查座標
+async function geocodeOne(rawAddr: string): Promise<{ lat: number; lng: number } | null> {
+  let addr = (rawAddr || '').trim();
+  if (!addr) return null;
+  // 桃園地區:沒含 市/縣 就補「桃園市」
+  if (!/[市縣]/.test(addr)) {
+    addr = '桃園市' + addr;
+  }
+  const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(addr)}&format=json&limit=1&countrycodes=tw`;
+  try {
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': NOMINATIM_UA, 'Accept-Language': 'zh-TW' },
+    });
+    if (!resp.ok) return null;
+    const data: any = await resp.json();
+    if (Array.isArray(data) && data.length > 0 && data[0].lat && data[0].lon) {
+      return { lat: Number(data[0].lat), lng: Number(data[0].lon) };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// POST /api/admin/student-import/:batch_id/geocode-step
+// 每次查一小批 (預設 10),回傳進度。前端反覆呼叫直到 remaining=0
+app.post('/api/admin/student-import/:batch_id/geocode-step', auth(['admin']), async (req: AuthRequest, res: Response) => {
+  const { batch_id } = req.params;
+  const stepSize = Math.min(Number(req.body?.step_size) || 10, 20);
+
+  try {
+    // 先把地址過短的直接標 failed (一次處理掉,不查 API)
+    await pool.query(
+      `UPDATE student_import_staging
+       SET match_status = 'failed'
+       WHERE batch_id = ? AND geo_lat IS NULL AND match_status != 'failed'
+         AND (home_address IS NULL OR CHAR_LENGTH(TRIM(home_address)) < 10)`,
+      [batch_id]
+    );
+
+    // 取這批還沒查座標、地址夠長的 (一次 stepSize 筆)
+    const [rows]: any = await pool.query(
+      `SELECT id, home_address FROM student_import_staging
+       WHERE batch_id = ? AND geo_lat IS NULL AND match_status != 'failed'
+         AND home_address IS NOT NULL AND CHAR_LENGTH(TRIM(home_address)) >= 10
+       ORDER BY id
+       LIMIT ?`,
+      [batch_id, stepSize]
+    );
+
+    let ok = 0, fail = 0;
+    for (const r of rows) {
+      const result = await geocodeOne(r.home_address);
+      if (result) {
+        await pool.query(
+          `UPDATE student_import_staging SET geo_lat = ?, geo_lng = ? WHERE id = ?`,
+          [result.lat, result.lng, r.id]
+        );
+        ok++;
+      } else {
+        await pool.query(
+          `UPDATE student_import_staging SET match_status = 'failed' WHERE id = ?`,
+          [r.id]
+        );
+        fail++;
+      }
+      await sleep(1100); // 遵守 Nominatim 1 req/s
+    }
+
+    // 回傳整體進度
+    const [stat]: any = await pool.query(
+      `SELECT
+         COUNT(*) AS total,
+         SUM(CASE WHEN geo_lat IS NOT NULL THEN 1 ELSE 0 END) AS geocoded,
+         SUM(CASE WHEN match_status = 'failed' THEN 1 ELSE 0 END) AS failed,
+         SUM(CASE WHEN geo_lat IS NULL AND match_status != 'failed' THEN 1 ELSE 0 END) AS remaining
+       FROM student_import_staging WHERE batch_id = ?`,
+      [batch_id]
+    );
+    const s = stat[0] || {};
+    res.json({
+      ok: true,
+      step_ok: ok,
+      step_fail: fail,
+      total: Number(s.total) || 0,
+      geocoded: Number(s.geocoded) || 0,
+      failed: Number(s.failed) || 0,
+      remaining: Number(s.remaining) || 0,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// GET /api/admin/student-import/:batch_id/geocode-status
+// 查目前進度 (進頁時先呼叫,顯示是否已查過)
+app.get('/api/admin/student-import/:batch_id/geocode-status', auth(['admin']), async (req: AuthRequest, res: Response) => {
+  const { batch_id } = req.params;
+  try {
+    const [stat]: any = await pool.query(
+      `SELECT
+         COUNT(*) AS total,
+         SUM(CASE WHEN geo_lat IS NOT NULL THEN 1 ELSE 0 END) AS geocoded,
+         SUM(CASE WHEN match_status = 'failed' THEN 1 ELSE 0 END) AS failed,
+         SUM(CASE WHEN geo_lat IS NULL AND match_status != 'failed' THEN 1 ELSE 0 END) AS remaining
+       FROM student_import_staging WHERE batch_id = ?`,
+      [batch_id]
+    );
+    const s = stat[0] || {};
+    res.json({
+      total: Number(s.total) || 0,
+      geocoded: Number(s.geocoded) || 0,
+      failed: Number(s.failed) || 0,
+      remaining: Number(s.remaining) || 0,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
