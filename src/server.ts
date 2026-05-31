@@ -2362,32 +2362,74 @@ const NOMINATIM_UA = 'worker-system-school-bus/1.0 (contact: admin@school-bus)';
 function sleep(ms: number) { return new Promise((r) => setTimeout(r, ms)); }
 
 // 單筆地址查座標
-async function geocodeOne(rawAddr: string): Promise<{ lat: number; lng: number } | null> {
-  let addr = (rawAddr || '').trim();
-  if (!addr) return null;
+// 嘗試多個地址變體 (從詳細到粗略),OSM 台灣資料巷弄級覆蓋差,逐級降級提升命中率
+function buildAddressFallbacks(rawAddr: string): string[] {
+  let a = (rawAddr || '').trim();
+  if (!a) return [];
   // 桃園地區:沒含 市/縣 就補「桃園市」
-  if (!/[市縣]/.test(addr)) {
-    addr = '桃園市' + addr;
-  }
-  const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(addr)}&format=json&limit=1&countrycodes=tw`;
-  try {
-    const resp = await fetch(url, {
-      headers: { 'User-Agent': NOMINATIM_UA, 'Accept-Language': 'zh-TW' },
-    });
-    if (!resp.ok) {
-      console.log(`[geocode] HTTP ${resp.status} for: ${addr}`);
-      return null;
-    }
-    const data: any = await resp.json();
-    if (Array.isArray(data) && data.length > 0 && data[0].lat && data[0].lon) {
-      return { lat: Number(data[0].lat), lng: Number(data[0].lon) };
-    }
-    console.log(`[geocode] no result for: ${addr}`);
+  if (!/[市縣]/.test(a)) a = '桃園市' + a;
+
+  const variants: string[] = [a];
+
+  // 1. 拿掉樓層 (X樓 / X樓之X / X樓之一)
+  let v1 = a.replace(/\d+樓(之[一二三四五六七八九十\d]+)?/g, '').trim();
+  if (v1 !== a && v1) variants.push(v1);
+
+  // 2. 拿掉門牌號碼 (XXX號)
+  let v2 = v1.replace(/\d+號(之[一二三四五六七八九十\d]+)?/g, '').replace(/[、,]\s*$/, '').trim();
+  if (v2 && !variants.includes(v2)) variants.push(v2);
+
+  // 3. 拿掉巷弄 (X巷 / X弄)
+  let v3 = v2.replace(/\d+巷/g, '').replace(/\d+弄/g, '').trim();
+  if (v3 && !variants.includes(v3)) variants.push(v3);
+
+  // 4. 拿掉里鄰 (X里 X鄰)
+  let v4 = v3.replace(/[\u4e00-\u9fa5]+里/g, '').replace(/\d+鄰/g, '').trim();
+  if (v4 && !variants.includes(v4)) variants.push(v4);
+
+  // 5. 只留到「區/鄉/鎮」
+  const m = a.match(/^(桃園市[\u4e00-\u9fa5]+[區鄉鎮市])/);
+  if (m && !variants.includes(m[1])) variants.push(m[1]);
+
+  return variants.filter(s => s.length >= 4); // 過短的不送
+}
+
+// 單筆地址查座標 (逐級降級重試)
+// 注意:結束前永遠 sleep 1.1 秒,保證下一次呼叫 geocodeOne 與本次的最後一次 API 間隔 ≥1.1s
+async function geocodeOne(rawAddr: string): Promise<{ lat: number; lng: number; matched: string } | null> {
+  const variants = buildAddressFallbacks(rawAddr);
+  if (variants.length === 0) {
+    await sleep(1100);
     return null;
-  } catch (e: any) {
-    console.log(`[geocode] error for "${addr}":`, e?.message || String(e));
-    return null;
   }
+
+  let result: { lat: number; lng: number; matched: string } | null = null;
+  for (let i = 0; i < variants.length; i++) {
+    const addr = variants[i];
+    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(addr)}&format=json&limit=1&countrycodes=tw`;
+    try {
+      const resp = await fetch(url, {
+        headers: { 'User-Agent': NOMINATIM_UA, 'Accept-Language': 'zh-TW' },
+      });
+      if (!resp.ok) {
+        console.log(`[geocode] HTTP ${resp.status} for: ${addr}`);
+      } else {
+        const data: any = await resp.json();
+        if (Array.isArray(data) && data.length > 0 && data[0].lat && data[0].lon) {
+          if (i > 0) console.log(`[geocode] fallback hit (level ${i}): "${rawAddr}" -> "${addr}"`);
+          result = { lat: Number(data[0].lat), lng: Number(data[0].lon), matched: addr };
+          break;
+        }
+      }
+    } catch (e: any) {
+      console.log(`[geocode] error for "${addr}":`, e?.message || String(e));
+    }
+    // 每次 API 呼叫之後都 sleep,保證 1 req/s
+    await sleep(1100);
+  }
+
+  if (!result) console.log(`[geocode] all fallbacks failed for: ${rawAddr}`);
+  return result;
 }
 
 // POST /api/admin/student-import/:batch_id/geocode-step
@@ -2432,7 +2474,7 @@ app.post('/api/admin/student-import/:batch_id/geocode-step', auth(['admin']), as
         );
         fail++;
       }
-      await sleep(1100); // 遵守 Nominatim 1 req/s
+      // 不需要外層 sleep,geocodeOne 內部已保證下一次 API 呼叫間隔 ≥1.1 秒
     }
 
     // 回傳整體進度
