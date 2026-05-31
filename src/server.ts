@@ -2374,13 +2374,18 @@ async function geocodeOne(rawAddr: string): Promise<{ lat: number; lng: number }
     const resp = await fetch(url, {
       headers: { 'User-Agent': NOMINATIM_UA, 'Accept-Language': 'zh-TW' },
     });
-    if (!resp.ok) return null;
+    if (!resp.ok) {
+      console.log(`[geocode] HTTP ${resp.status} for: ${addr}`);
+      return null;
+    }
     const data: any = await resp.json();
     if (Array.isArray(data) && data.length > 0 && data[0].lat && data[0].lon) {
       return { lat: Number(data[0].lat), lng: Number(data[0].lon) };
     }
+    console.log(`[geocode] no result for: ${addr}`);
     return null;
-  } catch {
+  } catch (e: any) {
+    console.log(`[geocode] error for "${addr}":`, e?.message || String(e));
     return null;
   }
 }
@@ -2476,6 +2481,22 @@ app.get('/api/admin/student-import/:batch_id/geocode-status', auth(['admin']), a
       failed: Number(s.failed) || 0,
       remaining: Number(s.remaining) || 0,
     });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// 3c-2 debug: 重置這批次的 geocoding 狀態,讓全部重查 (除了真的地址過短的)
+app.post('/api/admin/student-import/:batch_id/geocode-reset', auth(['admin']), async (req: AuthRequest, res: Response) => {
+  const { batch_id } = req.params;
+  try {
+    const [r]: any = await pool.query(
+      `UPDATE student_import_staging
+       SET match_status = 'pending', geo_lat = NULL, geo_lng = NULL
+       WHERE batch_id = ?`,
+      [batch_id]
+    );
+    res.json({ ok: true, reset: r.affectedRows });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
