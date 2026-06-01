@@ -2394,13 +2394,56 @@ function buildAddressFallbacks(rawAddr: string): string[] {
   return variants.filter(s => s.length >= 4); // 過短的不送
 }
 
+// ── 兜底座標策略 ──
+// 學校:有得雙語中小學,桃園市中壢區內壢長春一路 288 號
+// 規則:
+//   1. 地址寫出區的 (八德/平鎮/大溪/桃園/蘆竹/龜山/大園) -> 用該區中心座標
+//   2. 地址沒寫區、太短、亂寫 -> 用「學校位置」當預設
+const SCHOOL_LAT = 24.9627;     // 有得雙語中小學
+const SCHOOL_LNG = 121.2435;
+
+// 桃園各區中心座標 (查不到具體位置時依寫出的區兜底)
+const DISTRICT_CENTERS: Record<string, { lat: number; lng: number }> = {
+  '中壢區': { lat: SCHOOL_LAT, lng: SCHOOL_LNG }, // 學校所在,直接用學校座標
+  '桃園區': { lat: 24.9937, lng: 121.3010 },
+  '八德區': { lat: 24.9290, lng: 121.2843 },
+  '平鎮區': { lat: 24.9438, lng: 121.2156 },
+  '大溪區': { lat: 24.8807, lng: 121.2870 },
+  '蘆竹區': { lat: 25.0451, lng: 121.2870 },
+  '龜山區': { lat: 25.0367, lng: 121.3460 },
+  '大園區': { lat: 25.0668, lng: 121.1957 },
+  '楊梅區': { lat: 24.9080, lng: 121.1455 },
+  '龍潭區': { lat: 24.8636, lng: 121.2161 },
+  '新屋區': { lat: 24.9706, lng: 121.1062 },
+  '觀音區': { lat: 25.0335, lng: 121.0810 },
+  '復興區': { lat: 24.8203, lng: 121.3530 },
+};
+
+// 從地址抓出區名,沒寫就回 null (代表用學校預設)
+function detectDistrict(addr: string): string | null {
+  const m = addr.match(/([\u4e00-\u9fa5]{2,3}區)/);
+  if (m && DISTRICT_CENTERS[m[1]]) return m[1];
+  return null;
+}
+
+// 根據地址決定兜底座標
+function getFallback(rawAddr: string): { lat: number; lng: number; matched: string } {
+  const district = detectDistrict(rawAddr || '');
+  if (district) {
+    const c = DISTRICT_CENTERS[district];
+    return { lat: c.lat, lng: c.lng, matched: `${district} (區中心兜底)` };
+  }
+  return { lat: SCHOOL_LAT, lng: SCHOOL_LNG, matched: '學校位置 (預設兜底)' };
+}
+
 // 單筆地址查座標 (逐級降級重試)
 // 注意:結束前永遠 sleep 1.1 秒,保證下一次呼叫 geocodeOne 與本次的最後一次 API 間隔 ≥1.1s
 async function geocodeOne(rawAddr: string): Promise<{ lat: number; lng: number; matched: string } | null> {
   const variants = buildAddressFallbacks(rawAddr);
   if (variants.length === 0) {
     await sleep(1100);
-    return null;
+    // 空地址也兜底 (用學校位置,因為連區都沒寫)
+    return getFallback(rawAddr);
   }
 
   let result: { lat: number; lng: number; matched: string } | null = null;
@@ -2428,7 +2471,11 @@ async function geocodeOne(rawAddr: string): Promise<{ lat: number; lng: number; 
     await sleep(1100);
   }
 
-  if (!result) console.log(`[geocode] all fallbacks failed for: ${rawAddr}`);
+  if (!result) {
+    // 全部 fallback 都失敗 -> 依「地址寫的區」兜底,沒寫區才用學校位置
+    result = getFallback(rawAddr);
+    console.log(`[geocode] using ${result.matched} for: ${rawAddr}`);
+  }
   return result;
 }
 
@@ -2439,13 +2486,13 @@ app.post('/api/admin/student-import/:batch_id/geocode-step', auth(['admin']), as
   const stepSize = Math.min(Number(req.body?.step_size) || 10, 20);
 
   try {
-    // 先把地址過短的直接標 failed (一次處理掉,不查 API)
+    // 先把地址過短的直接給學校座標兜底 (沒地址無法判斷區,統一指向學校)
     await pool.query(
       `UPDATE student_import_staging
-       SET match_status = 'failed'
+       SET geo_lat = ?, geo_lng = ?
        WHERE batch_id = ? AND geo_lat IS NULL AND match_status != 'failed'
          AND (home_address IS NULL OR CHAR_LENGTH(TRIM(home_address)) < 10)`,
-      [batch_id]
+      [SCHOOL_LAT, SCHOOL_LNG, batch_id]
     );
 
     // 取這批還沒查座標、地址夠長的 (一次 stepSize 筆)
