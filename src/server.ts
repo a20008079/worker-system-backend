@@ -2363,11 +2363,23 @@ function sleep(ms: number) { return new Promise((r) => setTimeout(r, ms)); }
 
 // 單筆地址查座標
 // 嘗試多個地址變體 (從詳細到粗略),OSM 台灣資料巷弄級覆蓋差,逐級降級提升命中率
+// 策略:有寫區的照其區查;沒寫區的補「中壢區」(學校所在區),讓 OSM 至少能定位到中壢的某條路
 function buildAddressFallbacks(rawAddr: string): string[] {
   let a = (rawAddr || '').trim();
   if (!a) return [];
-  // 桃園地區:沒含 市/縣 就補「桃園市」
-  if (!/[市縣]/.test(a)) a = '桃園市' + a;
+
+  // ① 沒含「X區」就補「中壢區」(學校所在區,為預設)
+  // ② 沒含「桃園市」就補(配合區一起,OSM 命中率較高)
+  const hasDistrict = /[\u4e00-\u9fa5]{2,3}區/.test(a);
+  if (!hasDistrict) {
+    // 沒寫區 -> 補成「桃園市中壢區XXX」
+    // 移除可能的「桃園市」前綴,統一格式
+    a = a.replace(/^桃園市/, '').trim();
+    a = '桃園市中壢區' + a;
+  } else if (!/桃園市/.test(a)) {
+    // 有寫區但沒寫桃園市 -> 補桃園市
+    a = '桃園市' + a;
+  }
 
   const variants: string[] = [a];
 
@@ -2387,63 +2399,20 @@ function buildAddressFallbacks(rawAddr: string): string[] {
   let v4 = v3.replace(/[\u4e00-\u9fa5]+里/g, '').replace(/\d+鄰/g, '').trim();
   if (v4 && !variants.includes(v4)) variants.push(v4);
 
-  // 5. 只留到「區/鄉/鎮」
+  // 5. 只留到「區/鄉/鎮」(此時 a 已保證含區)
   const m = a.match(/^(桃園市[\u4e00-\u9fa5]+[區鄉鎮市])/);
   if (m && !variants.includes(m[1])) variants.push(m[1]);
 
   return variants.filter(s => s.length >= 4); // 過短的不送
 }
 
-// ── 兜底座標策略 ──
-// 學校:有得雙語中小學,桃園市中壢區內壢長春一路 288 號
-// 規則:
-//   1. 地址寫出區的 (八德/平鎮/大溪/桃園/蘆竹/龜山/大園) -> 用該區中心座標
-//   2. 地址沒寫區、太短、亂寫 -> 用「學校位置」當預設
-const SCHOOL_LAT = 24.9627;     // 有得雙語中小學
-const SCHOOL_LNG = 121.2435;
-
-// 桃園各區中心座標 (查不到具體位置時依寫出的區兜底)
-const DISTRICT_CENTERS: Record<string, { lat: number; lng: number }> = {
-  '中壢區': { lat: SCHOOL_LAT, lng: SCHOOL_LNG }, // 學校所在,直接用學校座標
-  '桃園區': { lat: 24.9937, lng: 121.3010 },
-  '八德區': { lat: 24.9290, lng: 121.2843 },
-  '平鎮區': { lat: 24.9438, lng: 121.2156 },
-  '大溪區': { lat: 24.8807, lng: 121.2870 },
-  '蘆竹區': { lat: 25.0451, lng: 121.2870 },
-  '龜山區': { lat: 25.0367, lng: 121.3460 },
-  '大園區': { lat: 25.0668, lng: 121.1957 },
-  '楊梅區': { lat: 24.9080, lng: 121.1455 },
-  '龍潭區': { lat: 24.8636, lng: 121.2161 },
-  '新屋區': { lat: 24.9706, lng: 121.1062 },
-  '觀音區': { lat: 25.0335, lng: 121.0810 },
-  '復興區': { lat: 24.8203, lng: 121.3530 },
-};
-
-// 從地址抓出區名,沒寫就回 null (代表用學校預設)
-function detectDistrict(addr: string): string | null {
-  const m = addr.match(/([\u4e00-\u9fa5]{2,3}區)/);
-  if (m && DISTRICT_CENTERS[m[1]]) return m[1];
-  return null;
-}
-
-// 根據地址決定兜底座標
-function getFallback(rawAddr: string): { lat: number; lng: number; matched: string } {
-  const district = detectDistrict(rawAddr || '');
-  if (district) {
-    const c = DISTRICT_CENTERS[district];
-    return { lat: c.lat, lng: c.lng, matched: `${district} (區中心兜底)` };
-  }
-  return { lat: SCHOOL_LAT, lng: SCHOOL_LNG, matched: '學校位置 (預設兜底)' };
-}
-
 // 單筆地址查座標 (逐級降級重試)
-// 注意:結束前永遠 sleep 1.1 秒,保證下一次呼叫 geocodeOne 與本次的最後一次 API 間隔 ≥1.1s
+// 查到任何層級的座標就算成功;全部查不到回 null,呼叫方會標 needs_manual
 async function geocodeOne(rawAddr: string): Promise<{ lat: number; lng: number; matched: string } | null> {
   const variants = buildAddressFallbacks(rawAddr);
   if (variants.length === 0) {
     await sleep(1100);
-    // 空地址也兜底 (用學校位置,因為連區都沒寫)
-    return getFallback(rawAddr);
+    return null; // 空地址 -> 待手動
   }
 
   let result: { lat: number; lng: number; matched: string } | null = null;
@@ -2472,9 +2441,8 @@ async function geocodeOne(rawAddr: string): Promise<{ lat: number; lng: number; 
   }
 
   if (!result) {
-    // 全部 fallback 都失敗 -> 依「地址寫的區」兜底,沒寫區才用學校位置
-    result = getFallback(rawAddr);
-    console.log(`[geocode] using ${result.matched} for: ${rawAddr}`);
+    console.log(`[geocode] needs manual: ${rawAddr}`);
+    // 不再兜底,讓呼叫方標 needs_manual
   }
   return result;
 }
@@ -2486,19 +2454,21 @@ app.post('/api/admin/student-import/:batch_id/geocode-step', auth(['admin']), as
   const stepSize = Math.min(Number(req.body?.step_size) || 10, 20);
 
   try {
-    // 先把地址過短的直接給學校座標兜底 (沒地址無法判斷區,統一指向學校)
+    // 先把地址過短/空白的直接標 needs_manual (沒地址,給老師手動補)
     await pool.query(
       `UPDATE student_import_staging
-       SET geo_lat = ?, geo_lng = ?
-       WHERE batch_id = ? AND geo_lat IS NULL AND match_status != 'failed'
+       SET match_status = 'needs_manual'
+       WHERE batch_id = ? AND geo_lat IS NULL
+         AND match_status NOT IN ('needs_manual', 'failed')
          AND (home_address IS NULL OR CHAR_LENGTH(TRIM(home_address)) < 10)`,
-      [SCHOOL_LAT, SCHOOL_LNG, batch_id]
+      [batch_id]
     );
 
-    // 取這批還沒查座標、地址夠長的 (一次 stepSize 筆)
+    // 取這批還沒查座標、還沒標 needs_manual、地址夠長的 (一次 stepSize 筆)
     const [rows]: any = await pool.query(
       `SELECT id, home_address FROM student_import_staging
-       WHERE batch_id = ? AND geo_lat IS NULL AND match_status != 'failed'
+       WHERE batch_id = ? AND geo_lat IS NULL
+         AND match_status NOT IN ('needs_manual', 'failed')
          AND home_address IS NOT NULL AND CHAR_LENGTH(TRIM(home_address)) >= 10
        ORDER BY id
        LIMIT ?`,
@@ -2515,8 +2485,9 @@ app.post('/api/admin/student-import/:batch_id/geocode-step', auth(['admin']), as
         );
         ok++;
       } else {
+        // 查不到 -> 標 needs_manual (連最寬鬆的「區」也查不到,需老師確認地址)
         await pool.query(
-          `UPDATE student_import_staging SET match_status = 'failed' WHERE id = ?`,
+          `UPDATE student_import_staging SET match_status = 'needs_manual' WHERE id = ?`,
           [r.id]
         );
         fail++;
@@ -2524,13 +2495,13 @@ app.post('/api/admin/student-import/:batch_id/geocode-step', auth(['admin']), as
       // 不需要外層 sleep,geocodeOne 內部已保證下一次 API 呼叫間隔 ≥1.1 秒
     }
 
-    // 回傳整體進度
+    // 回傳整體進度 (failed 欄位現在統計 needs_manual,前端顯示「待手動」)
     const [stat]: any = await pool.query(
       `SELECT
          COUNT(*) AS total,
          SUM(CASE WHEN geo_lat IS NOT NULL THEN 1 ELSE 0 END) AS geocoded,
-         SUM(CASE WHEN match_status = 'failed' THEN 1 ELSE 0 END) AS failed,
-         SUM(CASE WHEN geo_lat IS NULL AND match_status != 'failed' THEN 1 ELSE 0 END) AS remaining
+         SUM(CASE WHEN match_status = 'needs_manual' THEN 1 ELSE 0 END) AS failed,
+         SUM(CASE WHEN geo_lat IS NULL AND match_status NOT IN ('needs_manual','failed') THEN 1 ELSE 0 END) AS remaining
        FROM student_import_staging WHERE batch_id = ?`,
       [batch_id]
     );
@@ -2558,8 +2529,8 @@ app.get('/api/admin/student-import/:batch_id/geocode-status', auth(['admin']), a
       `SELECT
          COUNT(*) AS total,
          SUM(CASE WHEN geo_lat IS NOT NULL THEN 1 ELSE 0 END) AS geocoded,
-         SUM(CASE WHEN match_status = 'failed' THEN 1 ELSE 0 END) AS failed,
-         SUM(CASE WHEN geo_lat IS NULL AND match_status != 'failed' THEN 1 ELSE 0 END) AS remaining
+         SUM(CASE WHEN match_status = 'needs_manual' THEN 1 ELSE 0 END) AS failed,
+         SUM(CASE WHEN geo_lat IS NULL AND match_status NOT IN ('needs_manual','failed') THEN 1 ELSE 0 END) AS remaining
        FROM student_import_staging WHERE batch_id = ?`,
       [batch_id]
     );
