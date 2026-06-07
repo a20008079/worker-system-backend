@@ -2561,3 +2561,31 @@ app.post('/api/admin/student-import/:batch_id/geocode-reset', auth(['admin']), a
     res.status(500).json({ error: String(e) });
   }
 });
+
+// 3c-2 手動補座標 (老師用):為單筆 staging 學生設定 geo_lat/geo_lng,並把狀態改為已處理
+// body: { lat: number, lng: number }
+app.put('/api/admin/student-import/staging/:id/geo', auth(['admin']), async (req: AuthRequest, res: Response) => {
+  const id = Number(req.params.id);
+  const { lat, lng } = req.body || {};
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'invalid id' });
+  const latN = Number(lat);
+  const lngN = Number(lng);
+  if (!Number.isFinite(latN) || !Number.isFinite(lngN)) {
+    return res.status(400).json({ error: 'lat/lng must be numbers' });
+  }
+  if (latN < 23 || latN > 26 || lngN < 120 || lngN > 122) {
+    return res.status(400).json({ error: 'lat/lng 超出台灣範圍,請確認' });
+  }
+  try {
+    const [r]: any = await pool.query(
+      `UPDATE student_import_staging
+       SET geo_lat = ?, geo_lng = ?, match_status = 'pending'
+       WHERE id = ?`,
+      [latN, lngN, id]
+    );
+    if (r.affectedRows === 0) return res.status(404).json({ error: 'staging row not found' });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
