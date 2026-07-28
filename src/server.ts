@@ -1900,7 +1900,7 @@ app.get('/api/admin/buses/:bus_id/stops', auth(['admin']), async (req: AuthReque
   }
   try {
     const [rows]: any = await pool.query(
-      `SELECT id, bus_id, stop_name, stop_order, latitude, longitude, address, pickup_time
+      `SELECT id, bus_id, stop_name, stop_order, latitude, longitude, address, pickup_time, van_only_stop
        FROM bus_stops
        WHERE bus_id = ?
        ORDER BY stop_order IS NULL, stop_order, id`,
@@ -1919,7 +1919,7 @@ app.get('/api/admin/buses/:bus_id/stops', auth(['admin']), async (req: AuthReque
 // ============================================================
 app.post('/api/admin/buses/:bus_id/stops', auth(['admin']), async (req: AuthRequest, res: Response) => {
   const busId = Number(req.params.bus_id);
-  const { stop_name, latitude, longitude, address, pickup_time, stop_order } = req.body || {};
+  const { stop_name, latitude, longitude, address, pickup_time, stop_order, van_only_stop } = req.body || {};
   if (!Number.isInteger(busId) || busId <= 0) {
     return res.status(400).json({ error: 'invalid bus_id' });
   }
@@ -1935,8 +1935,8 @@ app.post('/api/admin/buses/:bus_id/stops', auth(['admin']), async (req: AuthRequ
     const defaultOrder = (maxRows[0]?.max_order || 0) + 1;
 
     const [r]: any = await pool.query(
-      `INSERT INTO bus_stops (bus_id, stop_name, stop_order, latitude, longitude, address, pickup_time)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO bus_stops (bus_id, stop_name, stop_order, latitude, longitude, address, pickup_time, van_only_stop)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         busId,
         stop_name.trim(),
@@ -1945,6 +1945,7 @@ app.post('/api/admin/buses/:bus_id/stops', auth(['admin']), async (req: AuthRequ
         longitude ?? null,
         address ?? null,
         pickup_time ?? null,
+        van_only_stop ? 1 : 0,
       ]
     );
     res.json({ ok: true, id: r.insertId });
@@ -2019,12 +2020,17 @@ app.put('/api/admin/stops/:id', auth(['admin']), async (req: AuthRequest, res: R
     return res.status(400).json({ error: 'invalid stop id' });
   }
   const allowedFields = new Set([
-    'stop_name', 'stop_order', 'latitude', 'longitude', 'address', 'pickup_time',
+    'stop_name', 'stop_order', 'latitude', 'longitude', 'address', 'pickup_time', 'van_only_stop',
   ]);
   const updates: string[] = [];
   const values: any[] = [];
   for (const [k, v] of Object.entries(req.body || {})) {
     if (!allowedFields.has(k)) continue;
+    if (k === 'van_only_stop') {
+      updates.push(`${k} = ?`);
+      values.push(v ? 1 : 0);
+      continue;
+    }
     updates.push(`${k} = ?`);
     values.push(v === '' ? null : v);
   }
@@ -2041,7 +2047,7 @@ app.put('/api/admin/stops/:id', auth(['admin']), async (req: AuthRequest, res: R
       return res.status(404).json({ error: 'stop not found' });
     }
     const [rows]: any = await pool.query(
-      'SELECT id, bus_id, stop_name, stop_order, latitude, longitude, address, pickup_time FROM bus_stops WHERE id = ?',
+      'SELECT id, bus_id, stop_name, stop_order, latitude, longitude, address, pickup_time, van_only_stop FROM bus_stops WHERE id = ?',
       [stopId]
     );
     res.json({ stop: rows[0] });
@@ -2151,7 +2157,7 @@ app.get('/api/parent/buses/:bus_id/stops', auth(['admin', 'parent']), async (req
   // 取站牌 (只回有座標的)
   try {
     const [rows]: any = await pool.query(
-      `SELECT id, bus_id, stop_name, stop_order, latitude, longitude, address, pickup_time
+      `SELECT id, bus_id, stop_name, stop_order, latitude, longitude, address, pickup_time, van_only_stop
        FROM bus_stops
        WHERE bus_id = ? AND latitude IS NOT NULL AND longitude IS NOT NULL
        ORDER BY stop_order IS NULL, stop_order, id`,
@@ -2346,6 +2352,243 @@ app.delete('/api/admin/student-import/:batch_id', auth(['admin']), async (req: A
   }
 });
 
+// ============================================================
+// 需求 1:Google 表單歸零重匯
+// (1) POST /api/admin/student-import/:batch_id/apply
+//     把某批次 staging 資料寫進正式 students 表
+//     邏輯比照舊版 /api/admin/import-semester,只是資料來源改成 staging
+// (2) POST /api/admin/students/reset-semester
+//     清空 students + 相關紀錄,保留 buses / drivers / parents
+// ============================================================
+
+// 套用:把 staging 批次寫進正式 students 表
+app.post('/api/admin/student-import/:batch_id/apply', auth(['admin']), async (req: AuthRequest, res: Response) => {
+  const { batch_id } = req.params;
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [rows]: any = await conn.query(
+      `SELECT * FROM student_import_staging WHERE batch_id = ? AND applied = 0 ORDER BY row_num`,
+      [batch_id]
+    );
+    if (rows.length === 0) {
+      await conn.rollback();
+      return res.status(400).json({ error: '這個批次沒有可套用的資料(可能已經全部套用過,或 batch_id 不存在)' });
+    }
+
+    // 站牌名稱 -> bus_id 對照(跟 import-semester 一樣的邏輯)
+    let stopMap: Record<string, number> = {};
+    try {
+      const [stops]: any = await conn.query(`SELECT stop_name, bus_id FROM bus_stops`);
+      stops.forEach((s: any) => { stopMap[s.stop_name.trim()] = s.bus_id; });
+    } catch {
+      // bus_stops 表不存在就跳過
+    }
+
+    // 跟 import-semester 一樣的時段清理邏輯
+    const cleanSession = (v: any): string => {
+      const s = (v ?? '').toString().trim();
+      if (!s || s === '不搭') return '不搭';
+      if (s.includes('1620')) return '1620';
+      if (s.includes('1800')) return '1800';
+      return '不搭';
+    };
+
+    let added = 0, updated = 0, failed = 0, nobus = 0;
+    const errors: string[] = [];
+    const unmatched: any[] = [];
+
+    for (const r of rows) {
+      try {
+        const studentName = (r.student_name || '').trim();
+        const parentPhone = (r.parent_phone || '').trim();
+        if (!studentName || !parentPhone) {
+          failed++;
+          errors.push(`第 ${r.row_num} 列(${studentName || '?'}):缺少姓名或電話,已跳過`);
+          continue;
+        }
+
+        const mon = cleanSession(r.mon_time);
+        const tue = cleanSession(r.tue_time);
+        const wed = cleanSession(r.wed_time);
+        const thu = cleanSession(r.thu_time);
+        const fri = cleanSession(r.fri_time);
+        const sessions = [mon, tue, wed, thu, fri].filter((s) => s !== '不搭');
+        let dismissalSession: string | null = null;
+        if (sessions.length > 0) {
+          if (sessions.every((s) => s === '1620')) dismissalSession = '1620';
+          else if (sessions.every((s) => s === '1800')) dismissalSession = '1800';
+          else dismissalSession = 'both';
+        }
+        const dayMap: Record<string, string> = { mon: '1', tue: '2', wed: '3', thu: '4', fri: '5' };
+        const activeDays = Object.entries({ mon, tue, wed, thu, fri })
+          .filter(([, v]) => v !== '不搭')
+          .map(([k]) => dayMap[k])
+          .join('');
+
+        const period = String(r.ride_period || '');
+        let schoolDir = 'both';
+        if (period.includes('上學') && !period.includes('放學')) schoolDir = 'morning';
+        else if (period.includes('放學') && !period.includes('上學')) schoolDir = 'afternoon';
+
+        const pickupClean = (r.pickup_stop || '').trim();
+        const dropoffClean = (r.dropoff_stop || '').trim();
+
+        // 站牌對應校車:優先用 staging 已推薦的 recommended_bus_id,沒有再查站名對照
+        let busId: number | null = r.recommended_bus_id || null;
+        if (!busId) {
+          if (stopMap[pickupClean]) busId = stopMap[pickupClean];
+          else if (stopMap[dropoffClean]) busId = stopMap[dropoffClean];
+        }
+        if (!busId) {
+          nobus++;
+          unmatched.push({
+            row_num: r.row_num,
+            student_name: studentName,
+            pickup_stop: pickupClean,
+            dropoff_stop: dropoffClean,
+            parent_phone: parentPhone,
+          });
+        }
+
+        // 家長:電話找得到就沿用,找不到就新建
+        let parentId: number;
+        const [existingParent]: any = await conn.query(
+          `SELECT id FROM parents WHERE phone=? OR account=? LIMIT 1`,
+          [parentPhone, parentPhone]
+        );
+        if (existingParent[0]) {
+          parentId = existingParent[0].id;
+          if (r.parent_name) {
+            await conn.query(`UPDATE parents SET name=? WHERE id=?`, [r.parent_name, parentId]);
+          }
+        } else {
+          const [pr]: any = await conn.query(
+            `INSERT INTO parents (name, account, password, phone) VALUES (?, ?, ?, ?)`,
+            [r.parent_name || parentPhone, parentPhone, parentPhone.slice(-4), parentPhone]
+          );
+          parentId = pr.insertId;
+        }
+
+        // 學生:同姓名 + 同家長視為同一人 -> 更新;否則新增
+        const [existingStudent]: any = await conn.query(
+          `SELECT id FROM students WHERE name=? AND parent_id=? LIMIT 1`,
+          [studentName, parentId]
+        );
+
+        let studentId: number;
+        if (existingStudent[0]) {
+          studentId = existingStudent[0].id;
+          await conn.query(
+            `UPDATE students SET
+               school_class=?, student_code=?, address=?, pickup_location=?,
+               dropoff_1620=?, dropoff_1800=?,
+               school_direction=?, dismissal_session=?, active_days=?,
+               dismissal_mon=?, dismissal_tue=?, dismissal_wed=?, dismissal_thu=?, dismissal_fri=?,
+               bus_id=COALESCE(?, bus_id), parent_phone=?
+             WHERE id=?`,
+            [
+              (r.class_name || '').trim() || null, (r.seat_no || '').trim() || null,
+              (r.home_address || '').trim() || null, pickupClean || null,
+              dropoffClean || null, dropoffClean || null,
+              schoolDir, dismissalSession, activeDays || '12345',
+              mon, tue, wed, thu, fri,
+              busId, parentPhone,
+              studentId,
+            ]
+          );
+          updated++;
+        } else {
+          const [ins]: any = await conn.query(
+            `INSERT INTO students
+               (name, school_class, student_code, parent_id, bus_id, address,
+                pickup_location, dropoff_1620, dropoff_1800,
+                school_direction, dismissal_session, active_days,
+                dismissal_mon, dismissal_tue, dismissal_wed, dismissal_thu, dismissal_fri,
+                parent_phone)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            [
+              studentName, (r.class_name || '').trim() || null, (r.seat_no || '').trim() || null,
+              parentId, busId, (r.home_address || '').trim() || null,
+              pickupClean || null, dropoffClean || null, dropoffClean || null,
+              schoolDir, dismissalSession, activeDays || '12345',
+              mon, tue, wed, thu, fri,
+              parentPhone,
+            ]
+          );
+          studentId = ins.insertId;
+          added++;
+        }
+
+        await conn.query(
+          `UPDATE student_import_staging SET applied = 1, matched_student_id = ? WHERE id = ?`,
+          [studentId, r.id]
+        );
+      } catch (e: any) {
+        failed++;
+        errors.push(`第 ${r.row_num} 列(${r.student_name || '?'}):${e.message}`);
+      }
+    }
+
+    await conn.commit();
+    res.json({
+      ok: true,
+      batch_id,
+      added, updated, failed, nobus,
+      errors,
+      unmatched, // 沒對到站牌的,需要 admin 手動指派校車
+      summary: `新增 ${added} 人、更新 ${updated} 人、失敗 ${failed} 人、待指派校車 ${nobus} 人`,
+    });
+  } catch (e) {
+    await conn.rollback();
+    res.status(500).json({ error: String(e) });
+  } finally {
+    conn.release();
+  }
+});
+
+// 歸零:清空 students + 相關紀錄,保留 buses / drivers / parents(固定配合車行,不用重建)
+// 危險操作,body 必須帶 { confirm: "RESET" } 才會真的執行
+app.post('/api/admin/students/reset-semester', auth(['admin']), async (req: AuthRequest, res: Response) => {
+  const { confirm } = req.body || {};
+  if (confirm !== 'RESET') {
+    return res.status(400).json({ error: '這是危險操作,body 需要帶 { "confirm": "RESET" } 才會執行,避免誤觸' });
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [cntRows]: any = await conn.query(`SELECT COUNT(*) AS cnt FROM students`);
+    const studentCount = Number(cntRows[0]?.cnt) || 0;
+
+    // 順序:先刪引用 students 的紀錄,最後才刪 students 本體
+    await conn.query(`DELETE FROM alighting_records`);
+    await conn.query(`DELETE FROM boarding_records`);
+    await conn.query(`DELETE FROM bus_audit_logs`);
+    await conn.query(`DELETE FROM students`);
+
+    // student_import_staging 的 matched_student_id 是指到 students.id 的軟參照,
+    // students 被清空後這些值會變成指向不存在的學生,一併清掉避免舊批次資料誤導
+    await conn.query(
+      `UPDATE student_import_staging SET matched_student_id = NULL WHERE matched_student_id IS NOT NULL`
+    );
+
+    await conn.commit();
+    res.json({
+      ok: true,
+      deleted_students: studentCount,
+      message: `已清空 ${studentCount} 筆學生資料,及對應的刷卡紀錄 / 修改紀錄。buses(車輛路線)、drivers(司機帳號)、parents(家長帳號)都保留未動,重新套用匯入時家長帳號會自動比對電話沿用。`,
+    });
+  } catch (e) {
+    await conn.rollback();
+    res.status(500).json({ error: String(e) });
+  } finally {
+    conn.release();
+  }
+});
 
 // ============================================================
 // 階段 3c Step 3c-2 : Geocoding (Nominatim 批次查經緯度)
