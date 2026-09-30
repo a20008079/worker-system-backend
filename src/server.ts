@@ -2772,6 +2772,40 @@ async function geocodeOne(rawAddr: string): Promise<{ lat: number; lng: number; 
   return result;
 }
 
+// ── 自動排車引擎 Step 1:依經緯度找最近站牌 ────────────────────
+// 地址查到經緯度後，在這裡算「離哪個站牌最近」，自動推薦校車。
+// 超過 MAX_STOP_DISTANCE_M 找不到夠近的站牌，就不推薦，留給老師手動指派
+// (呼應之前定案的規則:排不到就不硬塞,標「待手動」)。
+const MAX_STOP_DISTANCE_M = 1500;
+
+function haversineMeters(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const R = 6371000;
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+async function findNearestStop(lat: number, lng: number):
+  Promise<{ stop_id: number; bus_id: number; distance_m: number } | null> {
+  const [stops]: any = await pool.query(
+    `SELECT id, bus_id, latitude, longitude FROM bus_stops
+     WHERE latitude IS NOT NULL AND longitude IS NOT NULL`
+  );
+  let best: { stop_id: number; bus_id: number; distance_m: number } | null = null;
+  for (const s of stops) {
+    const d = haversineMeters(lat, lng, Number(s.latitude), Number(s.longitude));
+    if (!best || d < best.distance_m) {
+      best = { stop_id: s.id, bus_id: s.bus_id, distance_m: d };
+    }
+  }
+  if (best && best.distance_m <= MAX_STOP_DISTANCE_M) return best;
+  return null;
+}
+
 // POST /api/admin/student-import/:batch_id/geocode-step
 // 每次查一小批 (預設 10),回傳進度。前端反覆呼叫直到 remaining=0
 app.post('/api/admin/student-import/:batch_id/geocode-step', auth(['admin']), async (req: AuthRequest, res: Response) => {
@@ -2800,7 +2834,7 @@ app.post('/api/admin/student-import/:batch_id/geocode-step', auth(['admin']), as
       [batch_id, stepSize]
     );
 
-    let ok = 0, fail = 0;
+    let ok = 0, fail = 0, recommended = 0;
     for (const r of rows) {
       const result = await geocodeOne(r.home_address);
       if (result) {
@@ -2809,6 +2843,21 @@ app.post('/api/admin/student-import/:batch_id/geocode-step', auth(['admin']), as
           [result.lat, result.lng, r.id]
         );
         ok++;
+        // 自動排車引擎 Step 1:找最近站牌,推薦校車
+        try {
+          const nearest = await findNearestStop(result.lat, result.lng);
+          if (nearest) {
+            await pool.query(
+              `UPDATE student_import_staging
+               SET recommended_bus_id = ?, recommended_stop_id = ?
+               WHERE id = ?`,
+              [nearest.bus_id, nearest.stop_id, r.id]
+            );
+            recommended++;
+          }
+        } catch (e: any) {
+          console.error(`[recommend] 找最近站牌失敗 (staging id=${r.id})：`, e.message);
+        }
       } else {
         // 查不到 -> 標 needs_manual (連最寬鬆的「區」也查不到,需老師確認地址)
         await pool.query(
@@ -2835,6 +2884,7 @@ app.post('/api/admin/student-import/:batch_id/geocode-step', auth(['admin']), as
       ok: true,
       step_ok: ok,
       step_fail: fail,
+      step_recommended: recommended,
       total: Number(s.total) || 0,
       geocoded: Number(s.geocoded) || 0,
       failed: Number(s.failed) || 0,
