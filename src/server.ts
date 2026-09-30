@@ -63,6 +63,41 @@ const pool = mysql.createPool({
   } catch (e: any) {
     console.error('⚠️  migration 失敗（parents.phone 長度）：', e.message);
   }
+
+  // 測試用：確保每條有效路線(校車)至少有 3 位學生，方便學校現場測試司機/家長端登入畫面。
+  // ⚠️ 這是「隨機從待分配名單抓來湊測試用」，不是依實際住家地址算出來的正式排班，
+  //    只執行一次性補足（已經 >=3 人的路線不會再補），正式排班仍要靠之後的自動排車引擎重跑。
+  try {
+    const [buses]: any = await pool.query(
+      `SELECT id, bus_name, route_name FROM buses WHERE is_active = 1`
+    );
+    let filled = 0;
+    for (const bus of buses) {
+      const [cntRows]: any = await pool.query(
+        `SELECT COUNT(*) as cnt FROM students WHERE bus_id = ? AND is_active = 1`,
+        [bus.id]
+      );
+      const have = Number(cntRows[0]?.cnt || 0);
+      const need = 3 - have;
+      if (need > 0) {
+        const [candidates]: any = await pool.query(
+          `SELECT id FROM students WHERE bus_id IS NULL AND is_active = 1 LIMIT ?`,
+          [need]
+        );
+        for (const c of candidates) {
+          await pool.query(`UPDATE students SET bus_id = ? WHERE id = ?`, [bus.id, c.id]);
+          filled++;
+        }
+      }
+    }
+    if (filled > 0) {
+      console.log(`✅ migration: 已補 ${filled} 位測試學生到各路線（每條路線至少 3 位，供現場測試用，非正式排班）`);
+    } else {
+      console.log('ℹ️  migration: 各路線已有足夠測試學生，略過補派');
+    }
+  } catch (e: any) {
+    console.error('⚠️  migration 失敗（補測試學生到路線）：', e.message);
+  }
 })();
 
 
@@ -2605,12 +2640,16 @@ app.post('/api/admin/students/reset-semester', auth(['admin']), async (req: Auth
 
     const [cntRows]: any = await conn.query(`SELECT COUNT(*) AS cnt FROM students`);
     const studentCount = Number(cntRows[0]?.cnt) || 0;
+    const [parentCntRows]: any = await conn.query(`SELECT COUNT(*) AS cnt FROM parents`);
+    const parentCount = Number(parentCntRows[0]?.cnt) || 0;
 
-    // 順序:先刪引用 students 的紀錄,最後才刪 students 本體
+    // 順序:先刪引用 students 的紀錄,再刪 students 本體,最後才刪 parents
+    // (parents 被 students.parent_id 參照,students 要先清空 parents 才刪得掉)
     await conn.query(`DELETE FROM alighting_records`);
     await conn.query(`DELETE FROM boarding_records`);
     await conn.query(`DELETE FROM bus_audit_logs`);
     await conn.query(`DELETE FROM students`);
+    await conn.query(`DELETE FROM parents`);
 
     // student_import_staging 的 matched_student_id 是指到 students.id 的軟參照,
     // students 被清空後這些值會變成指向不存在的學生,一併清掉避免舊批次資料誤導
@@ -2622,7 +2661,8 @@ app.post('/api/admin/students/reset-semester', auth(['admin']), async (req: Auth
     res.json({
       ok: true,
       deleted_students: studentCount,
-      message: `已清空 ${studentCount} 筆學生資料,及對應的刷卡紀錄 / 修改紀錄。buses(車輛路線)、drivers(司機帳號)、parents(家長帳號)都保留未動,重新套用匯入時家長帳號會自動比對電話沿用。`,
+      deleted_parents: parentCount,
+      message: `已清空 ${studentCount} 筆學生資料、${parentCount} 筆家長帳號,及對應的刷卡紀錄 / 修改紀錄。buses(車輛路線)、drivers(司機帳號)都保留未動;parents(家長帳號)這次改成跟 students 一起清空,重新套用匯入時會依新表單資料自動建立全新的家長帳號。`,
     });
   } catch (e) {
     await conn.rollback();
