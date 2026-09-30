@@ -2321,13 +2321,22 @@ app.post('/api/admin/student-import/upload', auth(['admin']), async (req: AuthRe
         if (flagSummary[f] !== undefined) flagSummary[f]++;
       });
 
+      // 如果 Excel 裡已經有「緯度」「經度」欄位（例如 Google 表單那邊已經用
+      // Apps Script 先查好了），直接帶進來，之後 geocode-step 會偵測到
+      // geo_lat 已經有值，跳過重查 Nominatim，直接算最近站牌就好。
+      const preLat = r.geo_lat !== undefined && r.geo_lat !== '' && r.geo_lat !== null
+        ? Number(r.geo_lat) : null;
+      const preLng = r.geo_lng !== undefined && r.geo_lng !== '' && r.geo_lng !== null
+        ? Number(r.geo_lng) : null;
+      const hasPreGeo = preLat !== null && preLng !== null && !Number.isNaN(preLat) && !Number.isNaN(preLng);
+
       await conn.query(
         `INSERT INTO student_import_staging
           (batch_id, row_num, timestamp_raw, class_name, seat_no, student_name,
            parent_name, parent_phone, home_address, ride_period, pickup_stop,
            dropoff_stop, mon_time, tue_time, wed_time, thu_time, fri_time, note,
-           quality_flags)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           quality_flags, geo_lat, geo_lng)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           batchId,
           r.row_num || (i + 2),
@@ -2348,6 +2357,8 @@ app.post('/api/admin/student-import/upload', auth(['admin']), async (req: AuthRe
           (r.fri_time || '').toString().trim() || null,
           (r.note || '').trim() || null,
           flags || null,
+          hasPreGeo ? preLat : null,
+          hasPreGeo ? preLng : null,
         ]
       );
       inserted++;
@@ -2823,6 +2834,33 @@ app.post('/api/admin/student-import/:batch_id/geocode-step', auth(['admin']), as
       [batch_id]
     );
 
+    // ── 快速通道:這批裡有些學生「已經有現成經緯度」
+    // (例如 Google 表單那邊用 Apps Script 先查過、Excel 裡已經有「緯度」「經度」欄位)
+    // 這種不用打 Nominatim,直接算最近站牌就好,一次全部處理完,不受 stepSize 限制。
+    let preRecommended = 0;
+    const [preGeoRows]: any = await pool.query(
+      `SELECT id, geo_lat, geo_lng FROM student_import_staging
+       WHERE batch_id = ? AND geo_lat IS NOT NULL AND geo_lng IS NOT NULL
+         AND recommended_bus_id IS NULL`,
+      [batch_id]
+    );
+    for (const r of preGeoRows) {
+      try {
+        const nearest = await findNearestStop(Number(r.geo_lat), Number(r.geo_lng));
+        if (nearest) {
+          await pool.query(
+            `UPDATE student_import_staging
+             SET recommended_bus_id = ?, recommended_stop_id = ?
+             WHERE id = ?`,
+            [nearest.bus_id, nearest.stop_id, r.id]
+          );
+          preRecommended++;
+        }
+      } catch (e: any) {
+        console.error(`[recommend] 找最近站牌失敗 (staging id=${r.id}, 現成座標)：`, e.message);
+      }
+    }
+
     // 取這批還沒查座標、還沒標 needs_manual、地址夠長的 (一次 stepSize 筆)
     const [rows]: any = await pool.query(
       `SELECT id, home_address FROM student_import_staging
@@ -2885,6 +2923,7 @@ app.post('/api/admin/student-import/:batch_id/geocode-step', auth(['admin']), as
       step_ok: ok,
       step_fail: fail,
       step_recommended: recommended,
+      pre_geo_recommended: preRecommended,
       total: Number(s.total) || 0,
       geocoded: Number(s.geocoded) || 0,
       failed: Number(s.failed) || 0,
