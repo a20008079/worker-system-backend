@@ -45,6 +45,24 @@ const pool = mysql.createPool({
   } catch (e: any) {
     console.error('⚠️  migration 失敗（students.bus_id nullable）：', e.message);
   }
+
+  // 修正 2：parents.phone 長度不足，塞不下「兩個電話用 / 合併」的格式
+  // 例如 "0983291360/0952023101"（22 字），原欄位是 VARCHAR(20)
+  try {
+    const [rows]: any = await pool.query(
+      `SELECT CHARACTER_MAXIMUM_LENGTH FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'parents' AND COLUMN_NAME = 'phone'`
+    );
+    const len = rows[0] ? Number(rows[0].CHARACTER_MAXIMUM_LENGTH) : 0;
+    if (len && len < 50) {
+      await pool.query(`ALTER TABLE parents MODIFY COLUMN phone VARCHAR(50)`);
+      console.log(`✅ migration: parents.phone 從 VARCHAR(${len}) 放大為 VARCHAR(50)（修正雙電話合併格式塞不進去的問題）`);
+    } else {
+      console.log('ℹ️  migration: parents.phone 長度已足夠，略過');
+    }
+  } catch (e: any) {
+    console.error('⚠️  migration 失敗（parents.phone 長度）：', e.message);
+  }
 })();
 
 
