@@ -2088,7 +2088,70 @@ app.post('/api/admin/buses/:bus_id/stops/import-from-students', auth(['admin']),
 });
 
 // ============================================================
-// PUT /api/admin/stops/:id — 更新站牌
+// 站牌自動查詢經緯度(跟學生地址 geocoding 共用同一套 Nominatim 邏輯)
+// 優先用 address 欄位查,沒填 address 就直接拿 stop_name 本身當地址查。
+// GET  /api/admin/bus-stops/geocode-status
+// POST /api/admin/bus-stops/geocode-step
+// ============================================================
+app.get('/api/admin/bus-stops/geocode-status', auth(['admin']), async (_req: AuthRequest, res: Response) => {
+  try {
+    const [stat]: any = await pool.query(
+      `SELECT COUNT(*) AS total,
+              SUM(CASE WHEN latitude IS NOT NULL AND longitude IS NOT NULL THEN 1 ELSE 0 END) AS geocoded
+       FROM bus_stops`
+    );
+    const s = stat[0] || {};
+    const total = Number(s.total) || 0;
+    const geocoded = Number(s.geocoded) || 0;
+    res.json({ total, geocoded, remaining: total - geocoded });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.post('/api/admin/bus-stops/geocode-step', auth(['admin']), async (req: AuthRequest, res: Response) => {
+  const stepSize = Math.min(Number(req.body?.step_size) || 10, 20);
+  try {
+    const [rows]: any = await pool.query(
+      `SELECT id, stop_name, address FROM bus_stops
+       WHERE latitude IS NULL OR longitude IS NULL
+       ORDER BY id LIMIT ?`,
+      [stepSize]
+    );
+    let ok = 0, fail = 0;
+    for (const r of rows) {
+      const query = (r.address && String(r.address).trim()) || r.stop_name;
+      const result = await geocodeOne(query);
+      if (result) {
+        await pool.query(
+          `UPDATE bus_stops SET latitude = ?, longitude = ? WHERE id = ?`,
+          [result.lat, result.lng, r.id]
+        );
+        ok++;
+      } else {
+        fail++;
+      }
+    }
+    const [stat]: any = await pool.query(
+      `SELECT COUNT(*) AS total,
+              SUM(CASE WHEN latitude IS NOT NULL AND longitude IS NOT NULL THEN 1 ELSE 0 END) AS geocoded
+       FROM bus_stops`
+    );
+    const s = stat[0] || {};
+    const total = Number(s.total) || 0;
+    const geocoded = Number(s.geocoded) || 0;
+    res.json({
+      ok: true,
+      step_ok: ok,
+      step_fail: fail,
+      total,
+      geocoded,
+      remaining: total - geocoded,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
 // body: 任意 subset of { stop_name, stop_order, latitude, longitude, address, pickup_time }
 // ============================================================
 app.put('/api/admin/stops/:id', auth(['admin']), async (req: AuthRequest, res: Response) => {
