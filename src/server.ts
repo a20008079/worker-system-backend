@@ -24,6 +24,30 @@ const pool = mysql.createPool({
   timezone: '+08:00',
 });
 
+// ── 開機自動修正 schema：students.bus_id 改成可為 NULL ──────
+// 原因：import-semester / student-import 的「待分配校車」邏輯，
+// 會嘗試把找不到對應站牌的學生 bus_id 寫成 NULL，
+// 但原本 schema 是 NOT NULL，導致 insert 直接失敗、整批被算成「失敗」。
+// 這段開機時自動檢查並修正，跑過一次之後就不會再重複執行，
+// 不需要手動連資料庫下 SQL。
+(async () => {
+  try {
+    const [rows]: any = await pool.query(
+      `SELECT IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'students' AND COLUMN_NAME = 'bus_id'`
+    );
+    if (rows[0] && rows[0].IS_NULLABLE === 'NO') {
+      await pool.query(`ALTER TABLE students MODIFY COLUMN bus_id INT UNSIGNED NULL`);
+      console.log('✅ migration: students.bus_id 已改為可為 NULL（修正待分配校車匯入失敗問題）');
+    } else {
+      console.log('ℹ️  migration: students.bus_id 已經是 NULL-able，略過');
+    }
+  } catch (e: any) {
+    console.error('⚠️  migration 失敗（students.bus_id nullable）：', e.message);
+  }
+})();
+
+
 // ── JWT Middleware ─────────────────────────────────────
 interface AuthRequest extends Request {
   user?: { id: number; role: 'admin' | 'driver' | 'parent' };
