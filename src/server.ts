@@ -446,7 +446,7 @@ app.post('/api/driver/alight-manual', auth(['driver']), async (req: AuthRequest,
 
 app.post('/api/driver/scan', auth(['driver']), async (req: AuthRequest, res) => {
   const driverId = req.user!.id;
-  const { code } = req.body;
+  const { code, student_id } = req.body;
   try {
     const [sessions]: any = await pool.query(
       `SELECT ds.id, ds.bus_id FROM driver_sessions ds
@@ -455,14 +455,26 @@ app.post('/api/driver/scan', auth(['driver']), async (req: AuthRequest, res) => 
     );
     const session = sessions[0];
     if (!session) return res.status(400).json({ error: '請先上線' });
-    const [students]: any = await pool.query(
-      `SELECT s.id, s.name, s.school_class, s.bus_id,
-              s.pickup_location, s.dropoff_1620, s.dropoff_1800, s.dismissal_session,
-              p.name as parent_name, p.phone as parent_phone
-       FROM students s LEFT JOIN parents p ON s.parent_id = p.id
-       WHERE s.student_code = ? OR s.card_code = ? LIMIT 1`,
-      [code, code]
-    );
+    // 支援兩種查法:掃 QR/輸入代碼(code),或司機在名單上直接手動點選(student_id)
+    // ——因為有些學生(例如 Google 表單匯入、還沒建卡號的)沒有卡號可以掃,
+    // 手動點名單是唯一能記錄上車的方式,不能讓這批學生永遠卡住。
+    const [students]: any = student_id
+      ? await pool.query(
+          `SELECT s.id, s.name, s.school_class, s.bus_id,
+                  s.pickup_location, s.dropoff_1620, s.dropoff_1800, s.dismissal_session,
+                  p.name as parent_name, p.phone as parent_phone
+           FROM students s LEFT JOIN parents p ON s.parent_id = p.id
+           WHERE s.id = ? LIMIT 1`,
+          [student_id]
+        )
+      : await pool.query(
+          `SELECT s.id, s.name, s.school_class, s.bus_id,
+                  s.pickup_location, s.dropoff_1620, s.dropoff_1800, s.dismissal_session,
+                  p.name as parent_name, p.phone as parent_phone
+           FROM students s LEFT JOIN parents p ON s.parent_id = p.id
+           WHERE s.student_code = ? OR s.card_code = ? LIMIT 1`,
+          [code, code]
+        );
     const student = students[0];
     if (!student) return res.json({ status: 'not_found', message: '查無學生，請聯絡管理員' });
     if (student.bus_id !== session.bus_id)
@@ -472,6 +484,93 @@ app.post('/api/driver/scan', auth(['driver']), async (req: AuthRequest, res) => 
       [student.id, session.id]
     );
     res.json({ status: 'ok', message: `${student.name} 上車成功`, student });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// 名單頁直接點學生「標記上車」,不用掃碼/輸入代碼
+// (給沒有學生證卡號的學生用——例如 Google 表單匯入、還沒建卡的新生)
+app.post('/api/driver/board-manual', auth(['driver']), async (req: AuthRequest, res) => {
+  const driverId = req.user!.id;
+  const { student_id } = req.body;
+  if (!student_id) return res.status(400).json({ error: '缺少 student_id' });
+  try {
+    const [sessions]: any = await pool.query(
+      `SELECT ds.id, ds.bus_id FROM driver_sessions ds
+       WHERE ds.driver_id = ? AND ds.session_date = DATE(CONVERT_TZ(NOW(), '+00:00', '+08:00')) AND ds.end_time IS NULL LIMIT 1`,
+      [driverId]
+    );
+    const session = sessions[0];
+    if (!session) return res.status(400).json({ error: '請先上線' });
+    const [students]: any = await pool.query(
+      `SELECT id, name, school_class, bus_id FROM students WHERE id = ? LIMIT 1`,
+      [student_id]
+    );
+    const student = students[0];
+    if (!student) return res.json({ status: 'not_found', message: '查無學生' });
+    if (student.bus_id !== session.bus_id)
+      return res.json({ status: 'wrong_bus', message: `${student.name} 不是本車學生`, student });
+    await pool.query(
+      `INSERT INTO boarding_records (student_id, session_id) VALUES (?, ?) ON DUPLICATE KEY UPDATE boarded_at = NOW()`,
+      [student.id, session.id]
+    );
+    res.json({ status: 'ok', message: `${student.name} 已標記上車`, student });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// 名單頁直接點學生「標記下車」,不用掃碼/輸入代碼
+app.post('/api/driver/alight-manual', auth(['driver']), async (req: AuthRequest, res) => {
+  const driverId = req.user!.id;
+  const { student_id } = req.body;
+  if (!student_id) return res.status(400).json({ error: '缺少 student_id' });
+  try {
+    const [sessions]: any = await pool.query(
+      `SELECT ds.id, ds.bus_id FROM driver_sessions ds
+       WHERE ds.driver_id = ? AND ds.session_date = DATE(CONVERT_TZ(NOW(), '+00:00', '+08:00')) AND ds.end_time IS NULL LIMIT 1`,
+      [driverId]
+    );
+    const session = sessions[0];
+    if (!session) return res.status(400).json({ error: '請先上線' });
+    const [students]: any = await pool.query(
+      `SELECT id, name, school_class, bus_id,
+              dropoff_1620, dropoff_1800, dismissal_session,
+              dismissal_mon, dismissal_tue, dismissal_wed, dismissal_thu, dismissal_fri
+       FROM students WHERE id = ? LIMIT 1`,
+      [student_id]
+    );
+    const student = students[0];
+    if (!student) return res.json({ status: 'not_found', message: '查無學生' });
+    if (student.bus_id !== session.bus_id)
+      return res.json({ status: 'wrong_bus', message: `${student.name} 不是本車學生`, student });
+
+    const [boarding]: any = await pool.query(
+      `SELECT id FROM boarding_records WHERE student_id = ? AND session_id = ? LIMIT 1`,
+      [student.id, session.id]
+    );
+    if (!boarding[0])
+      return res.json({ status: 'not_boarded', message: `${student.name} 尚未上車記錄`, student });
+
+    await pool.query(
+      `INSERT INTO alighting_records (student_id, session_id) VALUES (?, ?)
+       ON DUPLICATE KEY UPDATE alighted_at = NOW()`,
+      [student.id, session.id]
+    );
+
+    const dayOfWeek = new Date().getDay();
+    const dayKeys: Record<number, string> = { 1: 'dismissal_mon', 2: 'dismissal_tue', 3: 'dismissal_wed', 4: 'dismissal_thu', 5: 'dismissal_fri' };
+    const todaySession = dayKeys[dayOfWeek] ? student[dayKeys[dayOfWeek]] : null;
+    const dropoffLocation = todaySession === '1620' ? student.dropoff_1620 : student.dropoff_1800;
+
+    res.json({
+      status: 'ok',
+      message: `${student.name} 已標記下車`,
+      student,
+      dropoff_location: dropoffLocation,
+      today_session: todaySession,
+    });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
@@ -1459,7 +1558,7 @@ app.get('/api/admin/history/stats', auth(['admin']), async (req, res) => {
 // ══════════════════════════════════════════════════════
 app.post('/api/driver/scan-alight', auth(['driver']), async (req: AuthRequest, res) => {
   const driverId = req.user!.id;
-  const { code } = req.body;
+  const { code, student_id } = req.body;
   try {
     const [sessions]: any = await pool.query(
       `SELECT ds.id, ds.bus_id FROM driver_sessions ds
@@ -1469,15 +1568,26 @@ app.post('/api/driver/scan-alight', auth(['driver']), async (req: AuthRequest, r
     const session = sessions[0];
     if (!session) return res.status(400).json({ error: '請先上線' });
 
-    const [students]: any = await pool.query(
-      `SELECT s.id, s.name, s.school_class, s.bus_id,
-              s.pickup_location, s.dropoff_1620, s.dropoff_1800, s.dismissal_session,
-              s.dismissal_mon, s.dismissal_tue, s.dismissal_wed, s.dismissal_thu, s.dismissal_fri,
-              p.name as parent_name, p.phone as parent_phone
-       FROM students s LEFT JOIN parents p ON s.parent_id = p.id
-       WHERE s.student_code = ? OR s.card_code = ? LIMIT 1`,
-      [code, code]
-    );
+    // 支援兩種查法:掃 QR/輸入代碼(code),或司機在名單上直接手動點選(student_id)
+    const [students]: any = student_id
+      ? await pool.query(
+          `SELECT s.id, s.name, s.school_class, s.bus_id,
+                  s.pickup_location, s.dropoff_1620, s.dropoff_1800, s.dismissal_session,
+                  s.dismissal_mon, s.dismissal_tue, s.dismissal_wed, s.dismissal_thu, s.dismissal_fri,
+                  p.name as parent_name, p.phone as parent_phone
+           FROM students s LEFT JOIN parents p ON s.parent_id = p.id
+           WHERE s.id = ? LIMIT 1`,
+          [student_id]
+        )
+      : await pool.query(
+          `SELECT s.id, s.name, s.school_class, s.bus_id,
+                  s.pickup_location, s.dropoff_1620, s.dropoff_1800, s.dismissal_session,
+                  s.dismissal_mon, s.dismissal_tue, s.dismissal_wed, s.dismissal_thu, s.dismissal_fri,
+                  p.name as parent_name, p.phone as parent_phone
+           FROM students s LEFT JOIN parents p ON s.parent_id = p.id
+           WHERE s.student_code = ? OR s.card_code = ? LIMIT 1`,
+          [code, code]
+        );
     const student = students[0];
     if (!student) return res.json({ status: 'not_found', message: '查無學生，請聯絡管理員' });
     if (student.bus_id !== session.bus_id)
