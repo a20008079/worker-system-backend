@@ -401,11 +401,32 @@ app.get('/api/parent/me', auth(['parent']), async (req: AuthRequest, res) => {
               s.school_direction,
               s.dismissal_mon, s.dismissal_tue, s.dismissal_wed, s.dismissal_thu, s.dismissal_fri,
               b.id as bus_id, b.bus_name, b.route_name
-       FROM students s JOIN buses b ON s.bus_id = b.id
+       FROM students s LEFT JOIN buses b ON s.bus_id = b.id
        WHERE s.parent_id = ? AND s.is_active = 1`,
       [parentId]
     );
     const result = await Promise.all(students.map(async (student: any) => {
+      // 還沒分配校車:直接回傳學生基本資料 + 狀態,不用查定位/上下車紀錄
+      if (!student.bus_id) {
+        return {
+          student: {
+            id: student.id, name: student.name, school_class: student.school_class,
+            pickup_location: student.pickup_location,
+            dropoff_1620: student.dropoff_1620, dropoff_1800: student.dropoff_1800,
+            dismissal_session: student.dismissal_session, active_days: student.active_days,
+            school_direction: student.school_direction,
+            dismissal_mon: student.dismissal_mon, dismissal_tue: student.dismissal_tue,
+            dismissal_wed: student.dismissal_wed, dismissal_thu: student.dismissal_thu,
+            dismissal_fri: student.dismissal_fri
+          },
+          bus: null,
+          bus_status: 'unassigned', // 前端可以用這個欄位顯示「尚未分配校車」
+          location: null,
+          is_online: false,
+          boarded_at: null,
+          alighted_at: null,
+        };
+      }
       const [locs]: any = await pool.query(
         `SELECT latitude, longitude, created_at FROM bus_locations WHERE bus_id = ? ORDER BY created_at DESC LIMIT 1`,
         [student.bus_id]
@@ -442,6 +463,7 @@ app.get('/api/parent/me', auth(['parent']), async (req: AuthRequest, res) => {
           dismissal_fri: student.dismissal_fri
         },
         bus: { id: student.bus_id, bus_name: student.bus_name, route_name: student.route_name },
+        bus_status: 'assigned',
         location: locs[0] || null,
         is_online: sessions.length > 0,
         boarded_at,
