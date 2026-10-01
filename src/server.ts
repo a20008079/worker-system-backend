@@ -317,6 +317,7 @@ app.get('/api/driver/students', auth(['driver']), async (req: AuthRequest, res) 
       `SELECT s.id, s.name, s.school_class, s.student_code,
               s.pickup_location, s.dropoff_1620, s.dropoff_1800,
               s.dismissal_session, s.active_days,
+              s.dismissal_mon, s.dismissal_tue, s.dismissal_wed, s.dismissal_thu, s.dismissal_fri,
               p.name as parent_name, p.phone as parent_phone
        FROM students s LEFT JOIN parents p ON s.parent_id = p.id
        WHERE s.bus_id = ? AND s.is_active = 1
@@ -326,6 +327,8 @@ app.get('/api/driver/students', auth(['driver']), async (req: AuthRequest, res) 
 
     let boardedIds: number[] = [];
     let boardingTimes: Record<number, string> = {};
+    let alightedIds: number[] = [];
+    let alightingTimes: Record<number, string> = {};
     if (session) {
       const [boarding]: any = await pool.query(
         `SELECT student_id, boarded_at FROM boarding_records WHERE session_id = ?`,
@@ -333,15 +336,34 @@ app.get('/api/driver/students', auth(['driver']), async (req: AuthRequest, res) 
       );
       boardedIds = boarding.map((b: any) => b.student_id);
       boarding.forEach((b: any) => { boardingTimes[b.student_id] = b.boarded_at; });
+
+      const [alighting]: any = await pool.query(
+        `SELECT student_id, alighted_at FROM alighting_records WHERE session_id = ?`,
+        [session.id]
+      );
+      alightedIds = alighting.map((a: any) => a.student_id);
+      alighting.forEach((a: any) => { alightingTimes[a.student_id] = a.alighted_at; });
     }
+
+    // 今天星期幾對應的放學時段/地點(下車模式名單要顯示今天會在哪個時段下車)
+    const dayKeys: Record<string, string> = { '1': 'dismissal_mon', '2': 'dismissal_tue', '3': 'dismissal_wed', '4': 'dismissal_thu', '5': 'dismissal_fri' };
+    const dayKey = todayKey ? dayKeys[todayKey] : null;
 
     const result = students
       .filter((s: any) => !todayKey || (s.active_days || '12345').includes(todayKey))
-      .map((s: any) => ({
-        ...s,
-        is_boarded: boardedIds.includes(s.id),
-        boarded_at: boardingTimes[s.id] || null
-      }));
+      .map((s: any) => {
+        const todaySession = dayKey ? s[dayKey] : null;
+        const todayDropoff = todaySession === '1620' ? s.dropoff_1620 : todaySession === '1800' ? s.dropoff_1800 : null;
+        return {
+          ...s,
+          is_boarded: boardedIds.includes(s.id),
+          boarded_at: boardingTimes[s.id] || null,
+          is_alighted: alightedIds.includes(s.id),
+          alighted_at: alightingTimes[s.id] || null,
+          today_session: todaySession,
+          today_dropoff: todayDropoff,
+        };
+      });
 
     res.json({
       students: result,
@@ -1624,12 +1646,6 @@ app.post('/api/driver/scan-alight', auth(['driver']), async (req: AuthRequest, r
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
-});
-
-// 取得下車記錄（給家長和管理員）
-app.get('/api/driver/students', auth(['driver']), async (req: AuthRequest, res) => {
-  // 此路由已在上方定義，這裡補充下車資訊版本
-  res.status(404).json({ error: 'use /api/driver/students' });
 });
 
 // ══════════════════════════════════════════════════════
