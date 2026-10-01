@@ -2634,14 +2634,14 @@ app.post('/api/admin/student-import/:batch_id/apply', auth(['admin']), async (re
           studentId = existingStudent[0].id;
           await conn.query(
             `UPDATE students SET
-               school_class=?, student_code=?, address=?, pickup_location=?,
+               school_class=?, address=?, pickup_location=?,
                dropoff_1620=?, dropoff_1800=?,
                school_direction=?, dismissal_session=?, active_days=?,
                dismissal_mon=?, dismissal_tue=?, dismissal_wed=?, dismissal_thu=?, dismissal_fri=?,
                bus_id=COALESCE(?, bus_id), parent_phone=?
              WHERE id=?`,
             [
-              (r.class_name || '').trim() || null, (r.seat_no || '').trim() || null,
+              (r.class_name || '').trim() || null,
               (r.home_address || '').trim() || null, pickupClean || null,
               dropoffClean || null, dropoffClean || null,
               schoolDir, dismissalSession, activeDays || '12345',
@@ -2654,14 +2654,14 @@ app.post('/api/admin/student-import/:batch_id/apply', auth(['admin']), async (re
         } else {
           const [ins]: any = await conn.query(
             `INSERT INTO students
-               (name, school_class, student_code, parent_id, bus_id, address,
+               (name, school_class, parent_id, bus_id, address,
                 pickup_location, dropoff_1620, dropoff_1800,
                 school_direction, dismissal_session, active_days,
                 dismissal_mon, dismissal_tue, dismissal_wed, dismissal_thu, dismissal_fri,
                 parent_phone)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
             [
-              studentName, (r.class_name || '').trim() || null, (r.seat_no || '').trim() || null,
+              studentName, (r.class_name || '').trim() || null,
               parentId, busId, (r.home_address || '').trim() || null,
               pickupClean || null, dropoffClean || null, dropoffClean || null,
               schoolDir, dismissalSession, activeDays || '12345',
