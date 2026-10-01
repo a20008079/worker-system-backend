@@ -355,6 +355,95 @@ app.get('/api/driver/students', auth(['driver']), async (req: AuthRequest, res) 
   }
 });
 
+// 司機後台直接點學生「標記上車」,不用掃碼/刷卡 (給家長手機沒帶卡、QR 碼損壞等情況用)
+app.post('/api/driver/board-manual', auth(['driver']), async (req: AuthRequest, res) => {
+  const driverId = req.user!.id;
+  const { student_id } = req.body;
+  if (!student_id) return res.status(400).json({ error: '缺少 student_id' });
+  try {
+    const [sessions]: any = await pool.query(
+      `SELECT ds.id, ds.bus_id FROM driver_sessions ds
+       WHERE ds.driver_id = ? AND ds.session_date = DATE(CONVERT_TZ(NOW(), '+00:00', '+08:00')) AND ds.end_time IS NULL LIMIT 1`,
+      [driverId]
+    );
+    const session = sessions[0];
+    if (!session) return res.status(400).json({ error: '請先上線' });
+
+    const [students]: any = await pool.query(
+      `SELECT id, name, school_class, bus_id FROM students WHERE id = ? LIMIT 1`,
+      [student_id]
+    );
+    const student = students[0];
+    if (!student) return res.json({ status: 'not_found', message: '查無學生' });
+    if (student.bus_id !== session.bus_id)
+      return res.json({ status: 'wrong_bus', message: `${student.name} 不是本車學生`, student });
+
+    await pool.query(
+      `INSERT INTO boarding_records (student_id, session_id) VALUES (?, ?) ON DUPLICATE KEY UPDATE boarded_at = NOW()`,
+      [student.id, session.id]
+    );
+    res.json({ status: 'ok', message: `${student.name} 已標記上車`, student });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// 司機後台直接點學生「標記下車」,不用掃碼/刷卡
+app.post('/api/driver/alight-manual', auth(['driver']), async (req: AuthRequest, res) => {
+  const driverId = req.user!.id;
+  const { student_id } = req.body;
+  if (!student_id) return res.status(400).json({ error: '缺少 student_id' });
+  try {
+    const [sessions]: any = await pool.query(
+      `SELECT ds.id, ds.bus_id FROM driver_sessions ds
+       WHERE ds.driver_id = ? AND ds.session_date = DATE(CONVERT_TZ(NOW(), '+00:00', '+08:00')) AND ds.end_time IS NULL LIMIT 1`,
+      [driverId]
+    );
+    const session = sessions[0];
+    if (!session) return res.status(400).json({ error: '請先上線' });
+
+    const [students]: any = await pool.query(
+      `SELECT id, name, school_class, bus_id,
+              dropoff_1620, dropoff_1800,
+              dismissal_mon, dismissal_tue, dismissal_wed, dismissal_thu, dismissal_fri
+       FROM students WHERE id = ? LIMIT 1`,
+      [student_id]
+    );
+    const student = students[0];
+    if (!student) return res.json({ status: 'not_found', message: '查無學生' });
+    if (student.bus_id !== session.bus_id)
+      return res.json({ status: 'wrong_bus', message: `${student.name} 不是本車學生`, student });
+
+    const [boarding]: any = await pool.query(
+      `SELECT id FROM boarding_records WHERE student_id = ? AND session_id = ? LIMIT 1`,
+      [student.id, session.id]
+    );
+    if (!boarding[0])
+      return res.json({ status: 'not_boarded', message: `${student.name} 尚未上車記錄`, student });
+
+    await pool.query(
+      `INSERT INTO alighting_records (student_id, session_id) VALUES (?, ?)
+       ON DUPLICATE KEY UPDATE alighted_at = NOW()`,
+      [student.id, session.id]
+    );
+
+    const dayOfWeek = new Date().getDay();
+    const dayKeys: Record<number, string> = { 1: 'dismissal_mon', 2: 'dismissal_tue', 3: 'dismissal_wed', 4: 'dismissal_thu', 5: 'dismissal_fri' };
+    const todaySession = dayKeys[dayOfWeek] ? student[dayKeys[dayOfWeek]] : null;
+    const dropoffLocation = todaySession === '1620' ? student.dropoff_1620 : student.dropoff_1800;
+
+    res.json({
+      status: 'ok',
+      message: `${student.name} 已標記下車`,
+      student,
+      dropoff_location: dropoffLocation,
+      today_session: todaySession,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
 app.post('/api/driver/scan', auth(['driver']), async (req: AuthRequest, res) => {
   const driverId = req.user!.id;
   const { code } = req.body;
