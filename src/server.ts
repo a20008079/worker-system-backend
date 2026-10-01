@@ -98,6 +98,42 @@ const pool = mysql.createPool({
   } catch (e: any) {
     console.error('⚠️  migration 失敗（補測試學生到路線）：', e.message);
   }
+
+  // 清理:之前查座標邏輯會把查不到詳細地址的站牌,退到「整個行政區中心點」,
+  // 導致好幾個不同站牌座標完全一樣(失真)。這裡偵測「座標重複出現 2 次以上」
+  // 的站牌,重置成 NULL,之後用新的嚴格模式重查就不會再落到這個陷阱。
+  try {
+    const [dupStops]: any = await pool.query(`
+      SELECT bs.id
+      FROM bus_stops bs
+      JOIN (
+        SELECT latitude, longitude
+        FROM bus_stops
+        WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+        GROUP BY latitude, longitude
+        HAVING COUNT(*) > 1
+      ) dup ON bs.latitude = dup.latitude AND bs.longitude = dup.longitude
+    `);
+    const dupIds: number[] = dupStops.map((r: any) => r.id);
+    if (dupIds.length > 0) {
+      await pool.query(
+        `UPDATE bus_stops SET latitude = NULL, longitude = NULL WHERE id IN (${dupIds.map(() => '?').join(',')})`,
+        dupIds
+      );
+      // 這些站牌座標被清掉了,之前靠它們算出來的「推薦校車」也不準,一併清掉等重算
+      await pool.query(
+        `UPDATE student_import_staging
+         SET recommended_bus_id = NULL, recommended_stop_id = NULL
+         WHERE recommended_stop_id IN (${dupIds.map(() => '?').join(',')})`,
+        dupIds
+      );
+      console.log(`✅ migration: 清掉 ${dupIds.length} 個站牌的失真重複座標(退到行政區中心點的那種),及對應的錯誤推薦校車紀錄,等你重新點「自動查詢缺座標的站牌」`);
+    } else {
+      console.log('ℹ️  migration: 沒有發現重複座標的站牌,略過');
+    }
+  } catch (e: any) {
+    console.error('⚠️  migration 失敗（清理重複座標站牌）：', e.message);
+  }
 })();
 
 
@@ -2121,7 +2157,7 @@ app.post('/api/admin/bus-stops/geocode-step', auth(['admin']), async (req: AuthR
     let ok = 0, fail = 0;
     for (const r of rows) {
       const query = (r.address && String(r.address).trim()) || r.stop_name;
-      const result = await geocodeOne(query);
+      const result = await geocodeOne(query, { strict: true });
       if (result) {
         await pool.query(
           `UPDATE bus_stops SET latitude = ?, longitude = ? WHERE id = ?`,
@@ -2807,11 +2843,21 @@ function buildAddressFallbacks(rawAddr: string): string[] {
 
 // 單筆地址查座標 (逐級降級重試)
 // 查到任何層級的座標就算成功;全部查不到回 null,呼叫方會標 needs_manual
-async function geocodeOne(rawAddr: string): Promise<{ lat: number; lng: number; matched: string } | null> {
-  const variants = buildAddressFallbacks(rawAddr);
+// strict=true:不接受「只剩整個區/鄉/鎮」這種太模糊的最後一層退回結果
+// (學生地址用一般模式;站牌名稱因為常常不是標準地址格式,改用嚴格模式,
+//  避免一堆站牌全部掉到同一個「行政區中心點」造成距離判斷失真)
+async function geocodeOne(
+  rawAddr: string,
+  opts: { strict?: boolean } = {}
+): Promise<{ lat: number; lng: number; matched: string } | null> {
+  let variants = buildAddressFallbacks(rawAddr);
+  if (opts.strict) {
+    // 丟掉「純行政區層級」這個最後保底的模糊選項 (例如「桃園市中壢區」)
+    variants = variants.filter(v => !/^桃園市[\u4e00-\u9fa5]+[區鄉鎮市]$/.test(v));
+  }
   if (variants.length === 0) {
     await sleep(1100);
-    return null; // 空地址 -> 待手動
+    return null; // 空地址,或嚴格模式下沒有夠精確的候選 -> 待手動
   }
 
   let result: { lat: number; lng: number; matched: string } | null = null;
